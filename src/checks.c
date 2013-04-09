@@ -25,6 +25,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
+#include <stdbool.h>
 
 #include <common/chunk.h>
 #include <common/compat.h>
@@ -37,6 +38,7 @@
 
 #include <proto/backend.h>
 #include <proto/checks.h>
+#include <proto/dumpstats.h>
 #include <proto/fd.h>
 #include <proto/log.h>
 #include <proto/queue.h>
@@ -198,7 +200,7 @@ static void server_status_printf(struct chunk *msg, struct server *s, unsigned o
  * Show information in logs about failed health check if server is UP
  * or succeeded health checks if server is DOWN.
  */
-static void set_server_check_status(struct server *s, short status, char *desc)
+static void set_server_check_status(struct server *s, short status, const char *desc)
 {
 	if (status == HCHK_STATUS_START) {
 		s->result = SRV_CHK_UNKNOWN;	/* no result yet */
@@ -619,7 +621,7 @@ void health_adjust(struct server *s, short status)
 	if (s->observe >= HANA_OBS_SIZE)
 		return;
 
-	if (status >= HCHK_STATUS_SIZE || !analyze_statuses[status].desc)
+	if (status >= HANA_STATUS_SIZE || !analyze_statuses[status].desc)
 		return;
 
 	switch (analyze_statuses[status].lr[s->observe - 1]) {
@@ -966,6 +968,55 @@ static void event_srv_chk_r(struct connection *conn)
 			set_server_check_status(s, HCHK_STATUS_L7STS, desc);
 		break;
 
+	case PR_O2_LB_AGENT_CHK: {
+		short status = HCHK_STATUS_L7RSP;
+		const char *desc = "Unknown feedback string";
+		const char *down_cmd = NULL;
+
+		if (!done)
+			goto wait_more_data;
+
+		cut_crlf(s->check.bi->data);
+
+		if (strchr(s->check.bi->data, '%')) {
+			desc = server_parse_weight_change_request(s, s->check.bi->data);
+			if (!desc) {
+				status = HCHK_STATUS_L7OKD;
+				desc = s->check.bi->data;
+			}
+		} else if (!strcasecmp(s->check.bi->data, "drain")) {
+			desc = server_parse_weight_change_request(s, "0%");
+			if (!desc) {
+				desc = "drain";
+				status = HCHK_STATUS_L7OKD;
+			}
+		} else if (!strncasecmp(s->check.bi->data, "down", strlen("down"))) {
+			down_cmd = "down";
+		} else if (!strncasecmp(s->check.bi->data, "stopped", strlen("stopped"))) {
+			down_cmd = "stopped";
+		} else if (!strncasecmp(s->check.bi->data, "fail", strlen("fail"))) {
+			down_cmd = "fail";
+		}
+
+		if (down_cmd) {
+			const char *end = s->check.bi->data + strlen(down_cmd);
+			/*
+			 * The command keyword must terminated the string or
+			 * be followed by a blank.
+			 */
+			if (end[0] == '\0' || end[0] == ' ' || end[0] == '\t') {
+				status = HCHK_STATUS_L7STS;
+				/* Skip over leading blanks */
+				while (end[0] != '\0' && (end[0] == ' ' || end[0] == '\t'))
+					end++;
+				desc = end;
+			}
+		}
+
+		set_server_check_status(s, status, desc);
+		break;
+	}
+
 	case PR_O2_PGSQL_CHK:
 		if (!done && s->check.bi->i < 9)
 			goto wait_more_data;
@@ -1185,7 +1236,8 @@ static int wake_srv_chk(struct connection *conn)
 
 	if (unlikely(conn->flags & CO_FL_ERROR)) {
 		/* Note that we might as well have been woken up by a handshake handler */
-		s->result |= SRV_CHK_FAILED;
+		if (s->result == SRV_CHK_UNKNOWN)
+			s->result |= SRV_CHK_FAILED;
 		__conn_data_stop_both(conn);
 		task_wakeup(s->check.task, TASK_WOKEN_IO);
 	}
@@ -1325,8 +1377,10 @@ static struct task *process_chk(struct task *t)
 		 * Note that we try to prevent the network stack from sending the ACK during the
 		 * connect() when a pure TCP check is used (without PROXY protocol).
 		 */
-		ret = s->check.proto->connect(conn, s->proxy->options2 & PR_O2_CHK_ANY,
-		                              s->check.send_proxy ? 1 : (s->proxy->options2 & PR_O2_CHK_ANY) ? 0 : 2);
+		ret = SN_ERR_INTERNAL;
+		if (s->check.proto->connect)
+			ret = s->check.proto->connect(conn, s->proxy->options2 & PR_O2_CHK_ANY,
+		                                      s->check.send_proxy ? 1 : (s->proxy->options2 & PR_O2_CHK_ANY) ? 0 : 2);
 		conn->flags |= CO_FL_WAKE_DATA;
 		if (s->check.send_proxy)
 			conn->flags |= CO_FL_LOCAL_SPROXY;
@@ -1387,16 +1441,6 @@ static struct task *process_chk(struct task *t)
 		 * which can happen on connect timeout or error.
 		 */
 		if (s->result == SRV_CHK_UNKNOWN) {
-			if (expired && conn->xprt) {
-				/* the check expired and the connection was not
-				 * yet closed, start by doing this.
-				 */
-				if (conn->ctrl)
-					setsockopt(conn->t.sock.fd, SOL_SOCKET, SO_LINGER,
-						   (struct linger *) &nolinger, sizeof(struct linger));
-				conn_full_close(conn);
-			}
-
 			if ((conn->flags & (CO_FL_CONNECTED|CO_FL_WAIT_L4_CONN)) == CO_FL_WAIT_L4_CONN) {
 				/* L4 not established (yet) */
 				if (conn->flags & CO_FL_ERROR)
@@ -1431,6 +1475,18 @@ static struct task *process_chk(struct task *t)
 		}
 
 		/* check complete or aborted */
+
+		if (conn->xprt) {
+			/* The check was aborted and the connection was not yet closed.
+			 * This can happen upon timeout, or when an external event such
+			 * as a failed response coupled with "observe layer7" caused the
+			 * server state to be suddenly changed.
+			 */
+			if (conn->ctrl)
+				setsockopt(conn->t.sock.fd, SOL_SOCKET, SO_LINGER,
+					   (struct linger *) &nolinger, sizeof(struct linger));
+			conn_full_close(conn);
+		}
 
 		if (s->result & SRV_CHK_FAILED) {    /* a failure or timeout detected */
 			if (s->health > s->rise) {

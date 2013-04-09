@@ -1,7 +1,7 @@
 /*
  * AF_INET/AF_INET6 SOCK_STREAM protocol layer (tcp)
  *
- * Copyright 2000-2010 Willy Tarreau <w@1wt.eu>
+ * Copyright 2000-2013 Willy Tarreau <w@1wt.eu>
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -550,8 +550,9 @@ int tcp_connect_probe(struct connection *conn)
 
 
 /* This function tries to bind a TCPv4/v6 listener. It may return a warning or
- * an error message in <err> if the message is at most <errlen> bytes long
- * (including '\0'). The return value is composed from ERR_ABORT, ERR_WARN,
+ * an error message in <errmsg> if the message is at most <errlen> bytes long
+ * (including '\0'). Note that <errmsg> may be NULL if <errlen> is also zero.
+ * The return value is composed from ERR_ABORT, ERR_WARN,
  * ERR_ALERT, ERR_RETRYABLE and ERR_FATAL. ERR_NONE indicates that everything
  * was alright and that no message was returned. ERR_RETRYABLE means that an
  * error occurred but that it may vanish after a retry (eg: port in use), and
@@ -565,10 +566,12 @@ int tcp_bind_listener(struct listener *listener, char *errmsg, int errlen)
 {
 	__label__ tcp_return, tcp_close_return;
 	int fd, err;
+	int ext, ready;
+	socklen_t ready_len;
 	const char *msg = NULL;
 
 	/* ensure we never return garbage */
-	if (errmsg && errlen)
+	if (errlen)
 		*errmsg = 0;
 
 	if (listener->state != LI_ASSIGNED)
@@ -576,7 +579,15 @@ int tcp_bind_listener(struct listener *listener, char *errmsg, int errlen)
 
 	err = ERR_NONE;
 
-	if ((fd = socket(listener->addr.ss_family, SOCK_STREAM, IPPROTO_TCP)) == -1) {
+	/* if the listener already has an fd assigned, then we were offered the
+	 * fd by an external process (most likely the parent), and we don't want
+	 * to create a new socket. However we still want to set a few flags on
+	 * the socket.
+	 */
+	fd = listener->fd;
+	ext = (fd >= 0);
+
+	if (!ext && (fd = socket(listener->addr.ss_family, SOCK_STREAM, IPPROTO_TCP)) == -1) {
 		err |= ERR_RETRYABLE | ERR_ALERT;
 		msg = "cannot create listening socket";
 		goto tcp_return;
@@ -594,7 +605,7 @@ int tcp_bind_listener(struct listener *listener, char *errmsg, int errlen)
 		goto tcp_close_return;
 	}
 
-	if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) == -1) {
+	if (!ext && setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) == -1) {
 		/* not fatal but should be reported */
 		msg = "cannot do so_reuseaddr";
 		err |= ERR_ALERT;
@@ -607,10 +618,11 @@ int tcp_bind_listener(struct listener *listener, char *errmsg, int errlen)
 	/* OpenBSD supports this. As it's present in old libc versions of Linux,
 	 * it might return an error that we will silently ignore.
 	 */
-	setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
+	if (!ext)
+		setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
 #endif
 #ifdef CONFIG_HAP_LINUX_TPROXY
-	if (listener->options & LI_O_FOREIGN) {
+	if (!ext && (listener->options & LI_O_FOREIGN)) {
 		switch (listener->addr.ss_family) {
 		case AF_INET:
 			if ((setsockopt(fd, SOL_IP, IP_TRANSPARENT, &one, sizeof(one)) == -1)
@@ -630,7 +642,7 @@ int tcp_bind_listener(struct listener *listener, char *errmsg, int errlen)
 #endif
 #ifdef SO_BINDTODEVICE
 	/* Note: this might fail if not CAP_NET_RAW */
-	if (listener->interface) {
+	if (!ext && listener->interface) {
 		if (setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE,
 			       listener->interface, strlen(listener->interface) + 1) == -1) {
 			msg = "cannot bind listener to device";
@@ -674,13 +686,19 @@ int tcp_bind_listener(struct listener *listener, char *errmsg, int errlen)
                 setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &zero, sizeof(zero));
 #endif
 
-	if (bind(fd, (struct sockaddr *)&listener->addr, listener->proto->sock_addrlen) == -1) {
+	if (!ext && bind(fd, (struct sockaddr *)&listener->addr, listener->proto->sock_addrlen) == -1) {
 		err |= ERR_RETRYABLE | ERR_ALERT;
 		msg = "cannot bind socket";
 		goto tcp_close_return;
 	}
 
-	if (listen(fd, listener->backlog ? listener->backlog : listener->maxconn) == -1) {
+	ready = 0;
+	ready_len = sizeof(ready);
+	if (getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, &ready, &ready_len) == -1)
+		ready = 0;
+
+	if (!(ext && ready) && /* only listen if not already done by external process */
+	    listen(fd, listener->backlog ? listener->backlog : listener->maxconn) == -1) {
 		err |= ERR_RETRYABLE | ERR_ALERT;
 		msg = "cannot listen to socket";
 		goto tcp_close_return;
@@ -1025,7 +1043,8 @@ int tcp_exec_req_rules(struct session *s)
 /* Parse a tcp-response rule. Return a negative value in case of failure */
 static int tcp_parse_response_rule(char **args, int arg, int section_type,
 				  struct proxy *curpx, struct proxy *defpx,
-				  struct tcp_rule *rule, char **err)
+				  struct tcp_rule *rule, char **err,
+                                  unsigned int where)
 {
 	if (curpx == defpx || !(curpx->cap & PR_CAP_BE)) {
 		memprintf(err, "%s %s is only allowed in 'backend' sections",
@@ -1069,8 +1088,9 @@ static int tcp_parse_response_rule(char **args, int arg, int section_type,
 
 /* Parse a tcp-request rule. Return a negative value in case of failure */
 static int tcp_parse_request_rule(char **args, int arg, int section_type,
-				  struct proxy *curpx, struct proxy *defpx,
-				  struct tcp_rule *rule, char **err)
+                                  struct proxy *curpx, struct proxy *defpx,
+                                  struct tcp_rule *rule, char **err,
+                                  unsigned int where)
 {
 	if (curpx == defpx) {
 		memprintf(err, "%s %s is not allowed in 'defaults' sections",
@@ -1092,7 +1112,8 @@ static int tcp_parse_request_rule(char **args, int arg, int section_type,
 
 		arg++;
 
-		expr = sample_parse_expr(args, &arg, trash.str, trash.size);
+		curpx->conf.args.ctx = ARGC_TRK;
+		expr = sample_parse_expr(args, &arg, trash.str, trash.size, &curpx->conf.args);
 		if (!expr) {
 			memprintf(err,
 			          "'%s %s %s' : %s",
@@ -1100,17 +1121,16 @@ static int tcp_parse_request_rule(char **args, int arg, int section_type,
 			return -1;
 		}
 
-		if (!(expr->fetch->cap & SMP_CAP_REQ)) {
+		if (!(expr->fetch->val & where)) {
 			memprintf(err,
-			          "'%s %s %s' : fetch method '%s' cannot be used on request",
-			          args[0], args[1], args[kw], trash.str);
+			          "'%s %s %s' : fetch method '%s' extracts information from '%s', none of which is available here",
+			          args[0], args[1], args[kw], args[arg], sample_src_names(expr->fetch->use));
 			free(expr);
 			return -1;
 		}
 
 		/* check if we need to allocate an hdr_idx struct for HTTP parsing */
-		if (expr->fetch->cap & SMP_CAP_L7)
-			curpx->acl_requires |= ACL_USE_L7_ANY;
+		curpx->http_needed |= !!(expr->fetch->use & SMP_USE_HTTP_ANY);
 
 		if (strcmp(args[arg], "table") == 0) {
 			arg++;
@@ -1169,6 +1189,9 @@ static int tcp_parse_tcp_rep(char **args, int section_type, struct proxy *curpx,
 	int warn = 0;
 	int arg;
 	struct tcp_rule *rule;
+	unsigned int where;
+	const struct acl *acl;
+	const char *kw;
 
 	if (!*args[1]) {
 		memprintf(err, "missing argument for '%s' in %s '%s'",
@@ -1204,22 +1227,43 @@ static int tcp_parse_tcp_rep(char **args, int section_type, struct proxy *curpx,
 	rule = calloc(1, sizeof(*rule));
 	LIST_INIT(&rule->list);
 	arg = 1;
+	where = 0;
 
 	if (strcmp(args[1], "content") == 0) {
 		arg++;
-		if (tcp_parse_response_rule(args, arg, section_type, curpx, defpx, rule, err) < 0)
+
+		if (curpx->cap & PR_CAP_FE)
+			where |= SMP_VAL_FE_RES_CNT;
+		if (curpx->cap & PR_CAP_BE)
+			where |= SMP_VAL_BE_RES_CNT;
+
+		if (tcp_parse_response_rule(args, arg, section_type, curpx, defpx, rule, err, where) < 0)
 			goto error;
 
-		if (rule->cond && (rule->cond->requires & ACL_USE_L6REQ_VOLATILE)) {
-			struct acl *acl;
-			const char *name;
+		acl = rule->cond ? acl_cond_conflicts(rule->cond, where) : NULL;
+		if (acl) {
+			if (acl->name && *acl->name)
+				memprintf(err,
+					  "acl '%s' will never match in '%s %s' because it only involves keywords that are incompatible with '%s'",
+					  acl->name, args[0], args[1], sample_ckp_names(where));
+			else
+				memprintf(err,
+					  "anonymous acl will never match in '%s %s' because it uses keyword '%s' which is incompatible with '%s'",
+					  args[0], args[1],
+					  LIST_ELEM(acl->expr.n, struct acl_expr *, list)->kw,
+					  sample_ckp_names(where));
 
-			acl = cond_find_require(rule->cond, ACL_USE_L6REQ_VOLATILE);
-			name = acl ? acl->name : "(unknown)";
-
-			memprintf(err,
-			          "acl '%s' involves some request-only criteria which will be ignored in '%s %s'",
-			          name, args[0], args[1]);
+			warn++;
+		}
+		else if (rule->cond && acl_cond_kw_conflicts(rule->cond, where, &acl, &kw)) {
+			if (acl->name && *acl->name)
+				memprintf(err,
+					  "acl '%s' involves keyword '%s' which is incompatible with '%s'",
+					  acl->name, kw, sample_ckp_names(where));
+			else
+				memprintf(err,
+					  "anonymous acl involves keyword '%s' which is incompatible with '%s'",
+					  kw, sample_ckp_names(where));
 			warn++;
 		}
 
@@ -1251,6 +1295,9 @@ static int tcp_parse_tcp_req(char **args, int section_type, struct proxy *curpx,
 	int warn = 0;
 	int arg;
 	struct tcp_rule *rule;
+	unsigned int where;
+	const struct acl *acl;
+	const char *kw;
 
 	if (!*args[1]) {
 		if (curpx == defpx)
@@ -1289,30 +1336,43 @@ static int tcp_parse_tcp_req(char **args, int section_type, struct proxy *curpx,
 	rule = calloc(1, sizeof(*rule));
 	LIST_INIT(&rule->list);
 	arg = 1;
+	where = 0;
 
 	if (strcmp(args[1], "content") == 0) {
 		arg++;
-		if (tcp_parse_request_rule(args, arg, section_type, curpx, defpx, rule, err) < 0)
+
+		if (curpx->cap & PR_CAP_FE)
+			where |= SMP_VAL_FE_REQ_CNT;
+		if (curpx->cap & PR_CAP_BE)
+			where |= SMP_VAL_BE_REQ_CNT;
+
+		if (tcp_parse_request_rule(args, arg, section_type, curpx, defpx, rule, err, where) < 0)
 			goto error;
 
-		if (rule->cond && (rule->cond->requires & ACL_USE_RTR_ANY)) {
-			struct acl *acl;
-			const char *name;
+		acl = rule->cond ? acl_cond_conflicts(rule->cond, where) : NULL;
+		if (acl) {
+			if (acl->name && *acl->name)
+				memprintf(err,
+					  "acl '%s' will never match in '%s %s' because it only involves keywords that are incompatible with '%s'",
+					  acl->name, args[0], args[1], sample_ckp_names(where));
+			else
+				memprintf(err,
+					  "anonymous acl will never match in '%s %s' because it uses keyword '%s' which is incompatible with '%s'",
+					  args[0], args[1],
+					  LIST_ELEM(acl->expr.n, struct acl_expr *, list)->kw,
+					  sample_ckp_names(where));
 
-			acl = cond_find_require(rule->cond, ACL_USE_RTR_ANY);
-			name = acl ? acl->name : "(unknown)";
-
-			memprintf(err,
-			          "acl '%s' involves some response-only criteria which will be ignored in '%s %s'",
-			          name, args[0], args[1]);
 			warn++;
 		}
-
-		if ((rule->action == TCP_ACT_TRK_SC1 || rule->action == TCP_ACT_TRK_SC2) &&
-		    !(rule->act_prm.trk_ctr.expr->fetch->cap & SMP_CAP_REQ)) {
-			memprintf(err,
-			          "fetch '%s' cannot be used on requests and will be ignored in '%s %s'",
-			          rule->act_prm.trk_ctr.expr->fetch->kw, args[0], args[1]);
+		else if (rule->cond && acl_cond_kw_conflicts(rule->cond, where, &acl, &kw)) {
+			if (acl->name && *acl->name)
+				memprintf(err,
+					  "acl '%s' involves keyword '%s' which is incompatible with '%s'",
+					  acl->name, kw, sample_ckp_names(where));
+			else
+				memprintf(err,
+					  "anonymous acl involves keyword '%s' which is incompatible with '%s'",
+					  kw, sample_ckp_names(where));
 			warn++;
 		}
 
@@ -1327,43 +1387,35 @@ static int tcp_parse_tcp_req(char **args, int section_type, struct proxy *curpx,
 			goto error;
 		}
 
-		if (tcp_parse_request_rule(args, arg, section_type, curpx, defpx, rule, err) < 0)
+		where |= SMP_VAL_FE_CON_ACC;
+
+		if (tcp_parse_request_rule(args, arg, section_type, curpx, defpx, rule, err, where) < 0)
 			goto error;
 
-		if (rule->cond && (rule->cond->requires & (ACL_USE_RTR_ANY|ACL_USE_L6_ANY|ACL_USE_L7_ANY))) {
-			struct acl *acl;
-			const char *name;
-
-			acl = cond_find_require(rule->cond, ACL_USE_RTR_ANY|ACL_USE_L6_ANY|ACL_USE_L7_ANY);
-			name = acl ? acl->name : "(unknown)";
-
-			if (acl->requires & (ACL_USE_L6_ANY|ACL_USE_L7_ANY)) {
+		acl = rule->cond ? acl_cond_conflicts(rule->cond, where) : NULL;
+		if (acl) {
+			if (acl->name && *acl->name)
 				memprintf(err,
-				          "'%s %s' may not reference acl '%s' which makes use of "
-				          "payload in %s '%s'. Please use '%s content' for this.",
-				          args[0], args[1], name, proxy_type_str(curpx), curpx->id, args[0]);
-				goto error;
-			}
-			if (acl->requires & ACL_USE_RTR_ANY)
+					  "acl '%s' will never match in '%s %s' because it only involves keywords that are incompatible with '%s'",
+					  acl->name, args[0], args[1], sample_ckp_names(where));
+			else
 				memprintf(err,
-				          "acl '%s' involves some response-only criteria which will be ignored in '%s %s'",
-				          name, args[0], args[1]);
+					  "anonymous acl will never match in '%s %s' because it uses keyword '%s' which is incompatible with '%s'",
+					  args[0], args[1],
+					  LIST_ELEM(acl->expr.n, struct acl_expr *, list)->kw,
+					  sample_ckp_names(where));
+
 			warn++;
 		}
-
-		if ((rule->action == TCP_ACT_TRK_SC1 || rule->action == TCP_ACT_TRK_SC2) &&
-		    !(rule->act_prm.trk_ctr.expr->fetch->cap & SMP_CAP_REQ)) {
-			memprintf(err,
-			          "fetch '%s' cannot be used on requests and will be ignored in '%s %s'",
-			          rule->act_prm.trk_ctr.expr->fetch->kw, args[0], args[1]);
-			warn++;
-		}
-
-		if ((rule->action == TCP_ACT_TRK_SC1 || rule->action == TCP_ACT_TRK_SC2) &&
-		    (rule->act_prm.trk_ctr.expr->fetch->cap & SMP_CAP_L7)) {
-			memprintf(err,
-			          "fetch '%s' involves some layer7-only criteria which will be ignored in '%s %s'",
-			          rule->act_prm.trk_ctr.expr->fetch->kw, args[0], args[1]);
+		else if (rule->cond && acl_cond_kw_conflicts(rule->cond, where, &acl, &kw)) {
+			if (acl->name && *acl->name)
+				memprintf(err,
+					  "acl '%s' involves keyword '%s' which is incompatible with '%s'",
+					  acl->name, kw, sample_ckp_names(where));
+			else
+				memprintf(err,
+					  "anonymous acl involves keyword '%s' which is incompatible with '%s'",
+					  kw, sample_ckp_names(where));
 			warn++;
 		}
 
@@ -1389,124 +1441,8 @@ static int tcp_parse_tcp_req(char **args, int section_type, struct proxy *curpx,
 
 
 /************************************************************************/
-/*       All supported sample fetch functios must be declared here      */
+/*       All supported sample fetch functions must be declared here     */
 /************************************************************************/
-
-/* Fetch the request RDP cookie identified in the args, or any cookie if no arg
- * is passed. It is usable both for ACL and for samples. Note: this decoder
- * only works with non-wrapping data. Accepts either 0 or 1 argument. Argument
- * is a string (cookie name), other types will lead to undefined behaviour.
- */
-int
-smp_fetch_rdp_cookie(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                     const struct arg *args, struct sample *smp)
-{
-	int bleft;
-	const unsigned char *data;
-
-	if (!l4 || !l4->req)
-		return 0;
-
-	smp->flags = 0;
-	smp->type = SMP_T_CSTR;
-
-	bleft = l4->req->buf->i;
-	if (bleft <= 11)
-		goto too_short;
-
-	data = (const unsigned char *)l4->req->buf->p + 11;
-	bleft -= 11;
-
-	if (bleft <= 7)
-		goto too_short;
-
-	if (strncasecmp((const char *)data, "Cookie:", 7) != 0)
-		goto not_cookie;
-
-	data += 7;
-	bleft -= 7;
-
-	while (bleft > 0 && *data == ' ') {
-		data++;
-		bleft--;
-	}
-
-	if (args) {
-
-		if (bleft <= args->data.str.len)
-			goto too_short;
-
-		if ((data[args->data.str.len] != '=') ||
-		    strncasecmp(args->data.str.str, (const char *)data, args->data.str.len) != 0)
-			goto not_cookie;
-
-		data += args->data.str.len + 1;
-		bleft -= args->data.str.len + 1;
-	} else {
-		while (bleft > 0 && *data != '=') {
-			if (*data == '\r' || *data == '\n')
-				goto not_cookie;
-			data++;
-			bleft--;
-		}
-
-		if (bleft < 1)
-			goto too_short;
-
-		if (*data != '=')
-			goto not_cookie;
-
-		data++;
-		bleft--;
-	}
-
-	/* data points to cookie value */
-	smp->data.str.str = (char *)data;
-	smp->data.str.len = 0;
-
-	while (bleft > 0 && *data != '\r') {
-		data++;
-		bleft--;
-	}
-
-	if (bleft < 2)
-		goto too_short;
-
-	if (data[0] != '\r' || data[1] != '\n')
-		goto not_cookie;
-
-	smp->data.str.len = (char *)data - smp->data.str.str;
-	smp->flags = SMP_F_VOLATILE;
-	return 1;
-
- too_short:
-	smp->flags = SMP_F_MAY_CHANGE;
- not_cookie:
-	return 0;
-}
-
-/************************************************************************/
-/*           All supported ACL keywords must be declared here.          */
-/************************************************************************/
-
-/* returns either 1 or 0 depending on whether an RDP cookie is found or not */
-static int
-acl_fetch_rdp_cookie_cnt(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                         const struct arg *args, struct sample *smp)
-{
-	int ret;
-
-	ret = smp_fetch_rdp_cookie(px, l4, l7, opt, args, smp);
-
-	if (smp->flags & SMP_F_MAY_CHANGE)
-		return 0;
-
-	smp->flags = SMP_F_VOLATILE;
-	smp->type = SMP_T_UINT;
-	smp->data.uint = ret;
-	return 1;
-}
-
 
 /* fetch the connection's source IPv4/IPv6 address */
 static int
@@ -1582,140 +1518,6 @@ smp_fetch_dport(struct proxy *px, struct session *l4, void *l7, unsigned int opt
 	return 1;
 }
 
-static int
-smp_fetch_payload_lv(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                     const struct arg *arg_p, struct sample *smp)
-{
-	unsigned int len_offset = arg_p[0].data.uint;
-	unsigned int len_size = arg_p[1].data.uint;
-	unsigned int buf_offset;
-	unsigned int buf_size = 0;
-	struct channel *chn;
-	int i;
-
-	/* Format is (len offset, len size, buf offset) or (len offset, len size) */
-	/* by default buf offset == len offset + len size */
-	/* buf offset could be absolute or relative to len offset + len size if prefixed by + or - */
-
-	if (!l4)
-		return 0;
-
-	chn = ((opt & SMP_OPT_DIR) == SMP_OPT_DIR_RES) ? l4->rep : l4->req;
-
-	if (!chn)
-		return 0;
-
-	if (len_offset + len_size > chn->buf->i)
-		goto too_short;
-
-	for (i = 0; i < len_size; i++) {
-		buf_size = (buf_size << 8) + ((unsigned char *)chn->buf->p)[i + len_offset];
-	}
-
-	/* buf offset may be implicit, absolute or relative */
-	buf_offset = len_offset + len_size;
-	if (arg_p[2].type == ARGT_UINT)
-		buf_offset = arg_p[2].data.uint;
-	else if (arg_p[2].type == ARGT_SINT)
-		buf_offset += arg_p[2].data.sint;
-
-	if (!buf_size || buf_size > chn->buf->size || buf_offset + buf_size > chn->buf->size) {
-		/* will never match */
-		smp->flags = 0;
-		return 0;
-	}
-
-	if (buf_offset + buf_size > chn->buf->i)
-		goto too_short;
-
-	/* init chunk as read only */
-	smp->type = SMP_T_CBIN;
-	chunk_initlen(&smp->data.str, chn->buf->p + buf_offset, 0, buf_size);
-	smp->flags = SMP_F_VOLATILE;
-	return 1;
-
- too_short:
-	smp->flags = SMP_F_MAY_CHANGE;
-	return 0;
-}
-
-static int
-smp_fetch_payload(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                  const struct arg *arg_p, struct sample *smp)
-{
-	unsigned int buf_offset = arg_p[0].data.uint;
-	unsigned int buf_size = arg_p[1].data.uint;
-	struct channel *chn;
-
-	if (!l4)
-		return 0;
-
-	chn = ((opt & SMP_OPT_DIR) == SMP_OPT_DIR_RES) ? l4->rep : l4->req;
-
-	if (!chn)
-		return 0;
-
-	if (!buf_size || buf_size > chn->buf->size || buf_offset + buf_size > chn->buf->size) {
-		/* will never match */
-		smp->flags = 0;
-		return 0;
-	}
-
-	if (buf_offset + buf_size > chn->buf->i)
-		goto too_short;
-
-	/* init chunk as read only */
-	smp->type = SMP_T_CBIN;
-	chunk_initlen(&smp->data.str, chn->buf->p + buf_offset, 0, buf_size);
-	smp->flags = SMP_F_VOLATILE;
-	return 1;
-
- too_short:
-	smp->flags = SMP_F_MAY_CHANGE;
-	return 0;
-}
-
-/* This function is used to validate the arguments passed to a "payload" fetch
- * keyword. This keyword expects two positive integers, with the second one
- * being strictly positive. It is assumed that the types are already the correct
- * ones. Returns 0 on error, non-zero if OK. If <err_msg> is not NULL, it will be
- * filled with a pointer to an error message in case of error, that the caller
- * is responsible for freeing. The initial location must either be freeable or
- * NULL.
- */
-static int val_payload(struct arg *arg, char **err_msg)
-{
-	if (!arg[1].data.uint) {
-		memprintf(err_msg, "payload length must be > 0");
-		return 0;
-	}
-	return 1;
-}
-
-/* This function is used to validate the arguments passed to a "payload_lv" fetch
- * keyword. This keyword allows two positive integers and an optional signed one,
- * with the second one being strictly positive and the third one being greater than
- * the opposite of the two others if negative. It is assumed that the types are
- * already the correct ones. Returns 0 on error, non-zero if OK. If <err_msg> is
- * not NULL, it will be filled with a pointer to an error message in case of
- * error, that the caller is responsible for freeing. The initial location must
- * either be freeable or NULL.
- */
-static int val_payload_lv(struct arg *arg, char **err_msg)
-{
-	if (!arg[1].data.uint) {
-		memprintf(err_msg, "payload length must be > 0");
-		return 0;
-	}
-
-	if (arg[2].type == ARGT_SINT &&
-	    (int)(arg[0].data.uint + arg[1].data.uint + arg[2].data.sint) < 0) {
-		memprintf(err_msg, "payload offset too negative");
-		return 0;
-	}
-	return 1;
-}
-
 #ifdef IPV6_V6ONLY
 /* parse the "v4v6" bind keyword */
 static int bind_parse_v4v6(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
@@ -1775,7 +1577,7 @@ static int bind_parse_defer_accept(char **args, int cur_arg, struct proxy *px, s
 #endif
 
 #ifdef TCP_FASTOPEN
-/* parse the "defer-accept" bind keyword */
+/* parse the "tfo" bind keyword */
 static int bind_parse_tfo(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
 	struct listener *l;
@@ -1838,25 +1640,23 @@ static int bind_parse_interface(char **args, int cur_arg, struct proxy *px, stru
 #endif
 
 static struct cfg_kw_list cfg_kws = {{ },{
-	{ CFG_LISTEN, "tcp-request", tcp_parse_tcp_req },
+	{ CFG_LISTEN, "tcp-request",  tcp_parse_tcp_req },
 	{ CFG_LISTEN, "tcp-response", tcp_parse_tcp_rep },
 	{ 0, NULL, NULL },
 }};
+
 
 /* Note: must not be declared <const> as its list will be overwritten.
  * Please take care of keeping this list alphabetically sorted.
  */
 static struct acl_kw_list acl_kws = {{ },{
-	{ "dst",        acl_parse_ip,    smp_fetch_dst,      acl_match_ip,  ACL_USE_TCP4_PERMANENT|ACL_MAY_LOOKUP, 0 },
-	{ "dst_port",   acl_parse_int,   smp_fetch_dport,    acl_match_int, ACL_USE_TCP_PERMANENT, 0  },
-	{ "payload",    acl_parse_str,   smp_fetch_payload,  acl_match_str, ACL_USE_L6REQ_VOLATILE|ACL_MAY_LOOKUP, ARG2(2,UINT,UINT), val_payload },
-	{ "payload_lv", acl_parse_str, smp_fetch_payload_lv, acl_match_str, ACL_USE_L6REQ_VOLATILE|ACL_MAY_LOOKUP, ARG3(2,UINT,UINT,SINT), val_payload_lv },
-	{ "req_rdp_cookie",     acl_parse_str, smp_fetch_rdp_cookie,     acl_match_str, ACL_USE_L6REQ_VOLATILE|ACL_MAY_LOOKUP, ARG1(0,STR) },
-	{ "req_rdp_cookie_cnt", acl_parse_int, acl_fetch_rdp_cookie_cnt, acl_match_int, ACL_USE_L6REQ_VOLATILE, ARG1(0,STR) },
-	{ "src",        acl_parse_ip,    smp_fetch_src,      acl_match_ip,  ACL_USE_TCP4_PERMANENT|ACL_MAY_LOOKUP, 0 },
-	{ "src_port",   acl_parse_int,   smp_fetch_sport,    acl_match_int, ACL_USE_TCP_PERMANENT, 0  },
-	{ NULL, NULL, NULL, NULL },
+	{ "dst",      NULL, acl_parse_ip,  acl_match_ip  },
+	{ "dst_port", NULL, acl_parse_int, acl_match_int },
+	{ "src",      NULL, acl_parse_ip,  acl_match_ip  },
+	{ "src_port", NULL, acl_parse_int, acl_match_int },
+	{ /* END */ },
 }};
+
 
 /* Note: must not be declared <const> as its list will be overwritten.
  * Note: fetches that may return multiple types must be declared as the lowest
@@ -1864,14 +1664,11 @@ static struct acl_kw_list acl_kws = {{ },{
  * instance v4/v6 must be declared v4.
  */
 static struct sample_fetch_kw_list sample_fetch_keywords = {{ },{
-	{ "src",         smp_fetch_src,           0,                      NULL,           SMP_T_IPV4, SMP_CAP_REQ|SMP_CAP_RES },
-	{ "dst",         smp_fetch_dst,           0,                      NULL,           SMP_T_IPV4, SMP_CAP_REQ|SMP_CAP_RES },
-	{ "dst_port",    smp_fetch_dport,         0,                      NULL,           SMP_T_UINT, SMP_CAP_REQ|SMP_CAP_RES },
-	{ "payload",     smp_fetch_payload,       ARG2(2,UINT,UINT),      val_payload,    SMP_T_CBIN, SMP_CAP_REQ|SMP_CAP_RES },
-	{ "payload_lv",  smp_fetch_payload_lv,    ARG3(2,UINT,UINT,SINT), val_payload_lv, SMP_T_CBIN, SMP_CAP_REQ|SMP_CAP_RES },
-	{ "rdp_cookie",  smp_fetch_rdp_cookie,    ARG1(1,STR),            NULL,           SMP_T_CSTR, SMP_CAP_REQ|SMP_CAP_RES },
-	{ "src_port",    smp_fetch_sport,         0,                      NULL,           SMP_T_UINT, SMP_CAP_REQ|SMP_CAP_RES },
-	{ NULL, NULL, 0, 0, 0 },
+	{ "dst",      smp_fetch_dst,   0, NULL, SMP_T_IPV4, SMP_USE_L4CLI },
+	{ "dst_port", smp_fetch_dport, 0, NULL, SMP_T_UINT, SMP_USE_L4CLI },
+	{ "src",      smp_fetch_src,   0, NULL, SMP_T_IPV4, SMP_USE_L4CLI },
+	{ "src_port", smp_fetch_sport, 0, NULL, SMP_T_UINT, SMP_USE_L4CLI },
+	{ /* END */ },
 }};
 
 /************************************************************************/

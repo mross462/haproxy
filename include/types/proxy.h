@@ -151,7 +151,8 @@ enum {
 #define PR_O2_MYSQL_CHK 0x50000000      /* use MYSQL check for server health */
 #define PR_O2_LDAP_CHK  0x60000000      /* use LDAP check for server health */
 #define PR_O2_SSL3_CHK  0x70000000      /* use SSLv3 CLIENT_HELLO packets for server health */
-/* unused: 0x80000000 to 0xF000000, reserved for health checks */
+#define PR_O2_LB_AGENT_CHK 0x80000000   /* use a TCP connection to obtain a metric of server health */
+/* unused: 0x90000000 to 0xF000000, reserved for health checks */
 #define PR_O2_CHK_ANY   0xF0000000      /* Mask to cover any check */
 /* end of proxy->options2 */
 
@@ -204,6 +205,7 @@ struct proxy {
 	unsigned int fe_req_ana, be_req_ana;	/* bitmap of common request protocol analysers for the frontend and backend */
 	unsigned int fe_rsp_ana, be_rsp_ana;	/* bitmap of common response protocol analysers for the frontend and backend */
 	int mode;				/* mode = PR_MODE_TCP, PR_MODE_HTTP or PR_MODE_HEALTH */
+	unsigned int http_needed;               /* non-null if HTTP analyser may be used */
 	union {
 		struct proxy *be;		/* default backend, or NULL if none set */
 		char *name;			/* default backend name during config parse */
@@ -226,7 +228,6 @@ struct proxy {
 		unsigned int inspect_delay;     /* inspection delay */
 		struct list inspect_rules;      /* inspection rules */
 	} tcp_rep;
-	int acl_requires;                       /* Elements required to satisfy all ACLs (ACL_USE_*) */
 	struct server *srv, defsrv;		/* known servers; default server configuration */
 	int srv_act, srv_bck;			/* # of servers eligible for LB (UP|!checked) AND (enabled+weight!=0) */
 	struct lbprm lbprm;			/* load-balancing parameters */
@@ -349,6 +350,7 @@ struct proxy {
 		struct eb_root used_server_id;	/* list of server IDs in use */
 		struct list bind;		/* list of bind settings */
 		struct list listeners;		/* list of listeners belonging to this frontend */
+		struct arg_list args;           /* sample arg list that need to be resolved */
 	} conf;					/* config information */
 	void *parent;				/* parent of the proxy when applicable */
 	struct comp *comp;			/* http compression */

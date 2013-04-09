@@ -89,7 +89,7 @@ enum {
 #define LI_O_CHK_MONNET 0x0020  /* check the source against a monitor-net rule */
 #define LI_O_ACC_PROXY  0x0040  /* find the proxied address in the first request line */
 #define LI_O_UNLIMITED  0x0080  /* listener not subject to global limits (peers & stats socket) */
-#define LI_O_TCP_FO     0x0100  /* enable TCP Fast Open (linux >= 3.6) */
+#define LI_O_TCP_FO     0x0100  /* enable TCP Fast Open (linux >= 3.7) */
 #define LI_O_V6ONLY     0x0200  /* bind to IPv6 only on Linux >= 2.4.21 */
 #define LI_O_V4V6       0x0400  /* bind to IPv4/IPv6 on Linux >= 2.4.21 */
 
@@ -127,6 +127,9 @@ struct bind_conf {
 	SSL_CTX *default_ctx;      /* SSL context of first/default certificate */
 	char *npn_str;             /* NPN protocol string */
 	int npn_len;               /* NPN protocol string length */
+	char *alpn_str;            /* ALPN protocol string */
+	int alpn_len;              /* ALPN protocol string length */
+	int strict_sni;            /* refuse negotiation if sni doesn't match a certificate */
 	struct eb_root sni_ctx;    /* sni_ctx tree of all known certs full-names sorted by name */
 	struct eb_root sni_w_ctx;  /* sni_ctx tree of all known certs wildcards sorted by name */
 #endif

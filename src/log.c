@@ -307,9 +307,9 @@ void add_to_logformat_list(char *start, char *end, int type, struct list *list_f
 /*
  * Parse the sample fetch expression <text> and add a node to <list_format> upon
  * success. At the moment, sample converters are not yet supported but fetch arguments
- * should work.
+ * should work. The curpx->conf.args.ctx must be set by the caller.
  */
-void add_sample_to_logformat_list(char *text, char *arg, int arg_len, struct proxy *curpx, struct list *list_format, int options)
+void add_sample_to_logformat_list(char *text, char *arg, int arg_len, struct proxy *curpx, struct list *list_format, int options, int cap)
 {
 	char *cmd[2];
 	struct sample_expr *expr;
@@ -320,7 +320,7 @@ void add_sample_to_logformat_list(char *text, char *arg, int arg_len, struct pro
 	cmd[1] = "";
 	cmd_arg = 0;
 
-	expr = sample_parse_expr(cmd, &cmd_arg, trash.str, trash.size);
+	expr = sample_parse_expr(cmd, &cmd_arg, trash.str, trash.size, &curpx->conf.args);
 	if (!expr) {
 		Warning("log-format: sample fetch <%s> failed with : %s\n", text, trash.str);
 		return;
@@ -335,31 +335,41 @@ void add_sample_to_logformat_list(char *text, char *arg, int arg_len, struct pro
 		node->arg = my_strndup(arg, arg_len);
 		parse_logformat_var_args(node->arg, node);
 	}
-	if (expr->fetch->cap & SMP_CAP_REQ)
+	if (expr->fetch->val & cap & SMP_VAL_REQUEST)
 		node->options |= LOG_OPT_REQ_CAP; /* fetch method is request-compatible */
 
-	if (expr->fetch->cap & SMP_CAP_RES)
+	if (expr->fetch->val & cap & SMP_VAL_RESPONSE)
 		node->options |= LOG_OPT_RES_CAP; /* fetch method is response-compatible */
+
+	if (!(expr->fetch->val & cap))
+		Warning("log-format: sample fetch <%s> may not be reliably used %s because it needs '%s' which is not available here.\n",
+			text, cap == SMP_VAL_FE_LOG_END ? "with 'log-format'" : "here", sample_src_names(expr->fetch->use));
 
 	/* check if we need to allocate an hdr_idx struct for HTTP parsing */
 	/* Note, we may also need to set curpx->to_log with certain fetches */
-	if (expr->fetch->cap & SMP_CAP_L7)
-		curpx->acl_requires |= ACL_USE_L7_ANY;
+	curpx->http_needed |= !!(expr->fetch->use & SMP_USE_HTTP_ANY);
 
+	/* FIXME: temporary workaround for missing LW_XPRT flag needed with some
+	 * sample fetches (eg: ssl*). We always set it for now on, but this will
+	 * leave with sample capabilities soon.
+	 */
+	curpx->to_log |= LW_XPRT;
 	LIST_ADDQ(list_format, &node->list);
 }
 
 /*
  * Parse the log_format string and fill a linked list.
  * Variable name are preceded by % and composed by characters [a-zA-Z0-9]* : %varname
- * You can set arguments using { } : %{many arguments}varname
+ * You can set arguments using { } : %{many arguments}varname.
+ * The curproxy->conf.args.ctx must be set by the caller.
  *
  *  str: the string to parse
  *  curproxy: the proxy affected
  *  list_format: the destination list
- *  capabilities: PR_MODE_TCP_ | PR_MODE_HTTP
+ *  options: LOG_OPT_* to force on every node
+ *  cap: all SMP_VAL_* flags supported by the consumer
  */
-void parse_logformat_string(const char *fmt, struct proxy *curproxy, struct list *list_format, int capabilities)
+void parse_logformat_string(const char *fmt, struct proxy *curproxy, struct list *list_format, int options, int cap)
 {
 	char *sp, *str, *backfmt; /* start pointer for text parts */
 	char *arg = NULL; /* start pointer for args */
@@ -369,7 +379,6 @@ void parse_logformat_string(const char *fmt, struct proxy *curproxy, struct list
 	int cformat; /* current token format */
 	int pformat; /* previous token format */
 	struct logformat_node *tmplf, *back;
-	int options = 0;
 
 	sp = str = backfmt = strdup(fmt);
 	curproxy->to_log |= LW_INIT;
@@ -469,7 +478,7 @@ void parse_logformat_string(const char *fmt, struct proxy *curproxy, struct list
 				parse_logformat_var(arg, arg_len, var, var_len, curproxy, list_format, &options);
 				break;
 			case LF_STEXPR:
-				add_sample_to_logformat_list(var, arg, arg_len, curproxy, list_format, options);
+				add_sample_to_logformat_list(var, arg, arg_len, curproxy, list_format, options, cap);
 				break;
 			case LF_TEXT:
 			case LF_SEPARATOR:
@@ -588,13 +597,18 @@ char *lf_text_len(char *dst, const char *src, size_t len, size_t size, struct lo
 		size--;
 	}
 
-	if (src) {
+	if (src && len) {
 		if (++len > size)
 			len = size;
 		len = strlcpy2(dst, src, len);
 
 		size -= len;
 		dst += len;
+	}
+	else if ((node->options & (LOG_OPT_QUOTE|LOG_OPT_MANDATORY)) == LOG_OPT_MANDATORY) {
+		if (size < 2)
+			return NULL;
+		*(dst++) = '-';
 	}
 
 	if (node->options & LOG_OPT_QUOTE) {
@@ -903,9 +917,7 @@ int build_logline(struct session *s, char *dst, size_t maxsize, struct list *lis
 					key = sample_fetch_string(be, s, txn, SMP_OPT_DIR_REQ|SMP_OPT_FINAL, tmp->expr);
 				if (!key && (tmp->options & LOG_OPT_RES_CAP))
 					key = sample_fetch_string(be, s, txn, SMP_OPT_DIR_RES|SMP_OPT_FINAL, tmp->expr);
-				if (!key)
-					break;
-				ret = lf_text_len(tmplog, key->data.str.str, key->data.str.len, dst + maxsize - tmplog, tmp);
+				ret = lf_text_len(tmplog, key ? key->data.str.str : NULL, key ? key->data.str.len : 0, dst + maxsize - tmplog, tmp);
 				if (ret == 0)
 					goto out;
 				tmplog = ret;
@@ -1050,10 +1062,11 @@ int build_logline(struct session *s, char *dst, size_t maxsize, struct list *lis
 			} else {
 				if ((dst + maxsize - tmplog) < 4)
 					goto out;
-				tmplog = utoa_pad((unsigned int)s->logs.accept_date.tv_usec/1000,
-						  tmplog, 4);
-				if (!tmplog)
+				ret = utoa_pad((unsigned int)s->logs.accept_date.tv_usec/1000,
+				               tmplog, 4);
+				if (ret == NULL)
 					goto out;
+				tmplog = ret;
 				last_isspace = 0;
 			}
 			break;

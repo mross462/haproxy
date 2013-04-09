@@ -14,6 +14,7 @@
 #   USE_MY_SPLICE        : redefine the splice syscall if build fails without.
 #   USE_NETFILTER        : enable netfilter on Linux. Automatic.
 #   USE_PCRE             : enable use of libpcre for regex. Recommended.
+#   USE_PCRE_JIT         : enable use of libpcre jit for regex. Recommended.
 #   USE_POLL             : enable poll(). Automatic.
 #   USE_PRIVATE_CACHE    : disable shared memory cache of ssl sessions.
 #   USE_REGPARM          : enable regparm optimization. Recommended on x86.
@@ -31,6 +32,7 @@
 #   USE_MY_ACCEPT4       : use own implemention of accept4() if glibc < 2.10.
 #   USE_ZLIB             : enable zlib library support.
 #   USE_CPU_AFFINITY     : enable pinning processes to CPU on Linux. Automatic.
+#   USE_TFO              : enable TCP fast open. Supported on Linux >= 3.7.
 #
 # Options can be forced by specifying "USE_xxx=1" or can be disabled by using
 # "USE_xxx=" (empty string).
@@ -64,6 +66,8 @@
 #   DLMALLOC_SRC   : build with dlmalloc, indicate the location of dlmalloc.c.
 #   DLMALLOC_THRES : should match PAGE_SIZE on every platform (default: 4096).
 #   PCREDIR        : force the path to libpcre.
+#   PCRE_LIB       : force the lib path to libpcre (defaults to $PCREDIR/lib).
+#   PCRE_INC       : force the include path to libpcre ($PCREDIR/inc)
 #   IGNOREGIT      : ignore GIT commit versions if set.
 #   VERSION        : force haproxy version reporting.
 #   SUBVERS        : add a sub-version (eg: platform, model, ...).
@@ -189,7 +193,10 @@ LDFLAGS = $(ARCH_FLAGS) -g
 # Depending on the target platform, some options are set, as well as some
 # CFLAGS and LDFLAGS. The USE_* values are set to "implicit" so that they are
 # not reported in the build options string. You should not have to change
-# anything there.
+# anything there. poll() is always supported, unless explicitly disabled by
+# passing USE_POLL="" on the make command line.
+USE_POLL   = default
+
 ifeq ($(TARGET),generic)
   # generic system target has nothing specific
   USE_POLL   = implicit
@@ -243,6 +250,7 @@ ifeq ($(TARGET),linux2628)
   USE_ACCEPT4     = implicit
   USE_FUTEX       = implicit
   USE_CPU_AFFINITY= implicit
+  ASSUME_SPLICE_WORKS= implicit
 else
 ifeq ($(TARGET),solaris)
   # This is for Solaris 8
@@ -257,6 +265,13 @@ ifeq ($(TARGET),solaris)
 else
 ifeq ($(TARGET),freebsd)
   # This is for FreeBSD
+  USE_POLL       = implicit
+  USE_KQUEUE     = implicit
+  USE_TPROXY     = implicit
+  USE_LIBCRYPT   = implicit
+else
+ifeq ($(TARGET),osx)
+  # This is for Mac OS/X
   USE_POLL       = implicit
   USE_KQUEUE     = implicit
   USE_TPROXY     = implicit
@@ -284,6 +299,7 @@ ifeq ($(TARGET),cygwin)
 endif # cygwin
 endif # aix52
 endif # openbsd
+endif # osx
 endif # freebsd
 endif # solaris
 endif # linux2628
@@ -449,6 +465,11 @@ OPTIONS_CFLAGS += -DUSE_MY_SPLICE
 BUILD_OPTIONS  += $(call ignore_implicit,USE_MY_SPLICE)
 endif
 
+ifneq ($(ASSUME_SPLICE_WORKS),)
+OPTIONS_CFLAGS += -DASSUME_SPLICE_WORKS
+BUILD_OPTIONS  += $(call ignore_implicit,ASSUME_SPLICE_WORKS)
+endif
+
 ifneq ($(USE_ACCEPT4),)
 OPTIONS_CFLAGS += -DUSE_ACCEPT4
 BUILD_OPTIONS  += $(call ignore_implicit,USE_ACCEPT4)
@@ -513,29 +534,41 @@ endif
 endif
 endif
 
-ifneq ($(USE_PCRE),)
-# PCREDIR is the directory hosting include/pcre.h and lib/libpcre.*. It is
-# automatically detected but can be forced if required. Forcing it to an empty
-# string will result in search only in the default paths.
-ifeq ($(PCREDIR),)
+ifneq ($(USE_PCRE)$(USE_STATIC_PCRE)$(USE_PCRE_JIT),)
+# PCREDIR is used to automatically construct the PCRE_INC and PCRE_LIB paths,
+# by appending /include and /lib respectively. If your system does not use the
+# same sub-directories, simply force these variables instead of PCREDIR. It is
+# automatically detected but can be forced if required (for cross-compiling).
+# Forcing PCREDIR to an empty string will let the compiler use the default
+# locations.
+
 PCREDIR	        := $(shell pcre-config --prefix 2>/dev/null || echo /usr/local)
-endif
-ifeq ($(USE_STATIC_PCRE),)
-OPTIONS_CFLAGS  += -DUSE_PCRE $(if $(PCREDIR),-I$(PCREDIR)/include)
-OPTIONS_LDFLAGS += $(if $(PCREDIR),-L$(PCREDIR)/lib) -lpcreposix -lpcre
-endif
-BUILD_OPTIONS   += $(call ignore_implicit,USE_PCRE)
+ifneq ($(PCREDIR),)
+PCRE_INC        := $(PCREDIR)/include
+PCRE_LIB        := $(PCREDIR)/lib
 endif
 
-ifneq ($(USE_STATIC_PCRE),)
-# PCREDIR is the directory hosting include/pcre.h and lib/libpcre.*. It is
-# automatically detected but can be forced if required.
-ifeq ($(PCREDIR),)
-PCREDIR         := $(shell pcre-config --prefix 2>/dev/null || echo /usr/local)
-endif
-OPTIONS_CFLAGS  += -DUSE_PCRE $(if $(PCREDIR),-I$(PCREDIR)/include)
-OPTIONS_LDFLAGS += $(if $(PCREDIR),-L$(PCREDIR)/lib) -Wl,-Bstatic -lpcreposix -lpcre -Wl,-Bdynamic
+ifeq ($(USE_STATIC_PCRE),)
+# dynamic PCRE
+OPTIONS_CFLAGS  += -DUSE_PCRE $(if $(PCRE_INC),-I$(PCRE_INC))
+OPTIONS_LDFLAGS += $(if $(PCRE_LIB),-L$(PCRE_LIB)) -lpcreposix -lpcre
+BUILD_OPTIONS   += $(call ignore_implicit,USE_PCRE)
+else
+# static PCRE
+OPTIONS_CFLAGS  += -DUSE_PCRE $(if $(PCRE_INC),-I$(PCRE_INC))
+OPTIONS_LDFLAGS += $(if $(PCRE_LIB),-L$(PCRE_LIB)) -Wl,-Bstatic -lpcreposix -lpcre -Wl,-Bdynamic
 BUILD_OPTIONS   += $(call ignore_implicit,USE_STATIC_PCRE)
+endif
+# JIT PCRE
+ifneq ($(USE_PCRE_JIT),)
+OPTIONS_CFLAGS  += -DUSE_PCRE_JIT
+endif
+endif
+
+# TCP Fast Open
+ifneq ($(USE_TFO),)
+OPTIONS_CFLAGS  += -DUSE_TFO
+BUILD_OPTIONS   += $(call ignore_implicit,USE_TFO)
 endif
 
 # This one can be changed to look for ebtree files in an external directory
@@ -587,7 +620,7 @@ all:
 	@echo
 	@exit 1
 else
-all: haproxy
+all: haproxy haproxy-systemd-wrapper
 endif
 
 OBJS = src/haproxy.o src/sessionhash.o src/base64.o src/protocol.o \
@@ -601,7 +634,7 @@ OBJS = src/haproxy.o src/sessionhash.o src/base64.o src/protocol.o \
        src/stream_interface.o src/dumpstats.o src/proto_tcp.o \
        src/session.o src/hdr_idx.o src/ev_select.o src/signal.o \
        src/acl.o src/sample.o src/memory.o src/freq_ctr.o src/auth.o \
-       src/compression.o
+       src/compression.o src/payload.o
 
 EBTREE_OBJS = $(EBTREE_DIR)/ebtree.o \
               $(EBTREE_DIR)/eb32tree.o $(EBTREE_DIR)/eb64tree.o \
@@ -612,10 +645,15 @@ ifneq ($(TRACE),)
 OBJS += src/trace.o
 endif
 
+WRAPPER_OBJS = src/haproxy-systemd-wrapper.o
+
 # Not used right now
 LIB_EBTREE = $(EBTREE_DIR)/libebtree.a
 
 haproxy: $(OBJS) $(OPTIONS_OBJS) $(EBTREE_OBJS)
+	$(LD) $(LDFLAGS) -o $@ $^ $(LDOPTS)
+
+haproxy-systemd-wrapper: $(WRAPPER_OBJS)
 	$(LD) $(LDFLAGS) -o $@ $^ $(LDOPTS)
 
 $(LIB_EBTREE): $(EBTREE_OBJS)
@@ -640,6 +678,11 @@ src/haproxy.o:	src/haproxy.c
 	      -DBUILD_OPTIONS='"$(strip $(BUILD_OPTIONS))"' \
 	       -c -o $@ $<
 
+src/haproxy-systemd-wrapper.o:	src/haproxy-systemd-wrapper.c
+	$(CC) $(COPTS) \
+	      -DSBINDIR='"$(strip $(SBINDIR))"' \
+	       -c -o $@ $<
+
 src/dlmalloc.o: $(DLMALLOC_SRC)
 	$(CC) $(COPTS) -DDEFAULT_MMAP_THRESHOLD=$(DLMALLOC_THRES) -c -o $@ $<
 
@@ -653,9 +696,10 @@ install-doc:
 		install -m 644 doc/$$x.txt $(DESTDIR)$(DOCDIR) ; \
 	done
 
-install-bin: haproxy
+install-bin: haproxy haproxy-systemd-wrapper
 	install -d $(DESTDIR)$(SBINDIR)
 	install haproxy $(DESTDIR)$(SBINDIR)
+	install haproxy-systemd-wrapper $(DESTDIR)$(SBINDIR)
 
 install: install-bin install-man install-doc
 
@@ -664,6 +708,7 @@ clean:
 	for dir in . src include/* doc ebtree; do rm -f $$dir/*~ $$dir/*.rej $$dir/core; done
 	rm -f haproxy-$(VERSION).tar.gz haproxy-$(VERSION)$(SUBVERS).tar.gz
 	rm -f haproxy-$(VERSION) nohup.out gmon.out
+	rm -f haproxy-systemd-wrapper
 
 tags:
 	find src include \( -name '*.c' -o -name '*.h' \) -print0 | \
