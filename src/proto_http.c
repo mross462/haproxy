@@ -488,6 +488,75 @@ int http_header_match2(const char *hdr, const char *end,
 	return val - hdr;
 }
 
+/* Find the first or next occurrence of header <name> in message buffer <sol>
+ * using headers index <idx>, and return it in the <ctx> structure. This
+ * structure holds everything necessary to use the header and find next
+ * occurrence. If its <idx> member is 0, the header is searched from the
+ * beginning. Otherwise, the next occurrence is returned. The function returns
+ * 1 when it finds a value, and 0 when there is no more. It is very similar to
+ * http_find_header2() except that it is designed to work with full-line headers
+ * whose comma is not a delimiter but is part of the syntax. As a special case,
+ * if ctx->val is NULL when searching for a new values of a header, the current
+ * header is rescanned. This allows rescanning after a header deletion.
+ */
+int http_find_full_header2(const char *name, int len,
+                           char *sol, struct hdr_idx *idx,
+                           struct hdr_ctx *ctx)
+{
+	char *eol, *sov;
+	int cur_idx, old_idx;
+
+	cur_idx = ctx->idx;
+	if (cur_idx) {
+		/* We have previously returned a header, let's search another one */
+		sol = ctx->line;
+		eol = sol + idx->v[cur_idx].len;
+		goto next_hdr;
+	}
+
+	/* first request for this header */
+	sol += hdr_idx_first_pos(idx);
+	old_idx = 0;
+	cur_idx = hdr_idx_first_idx(idx);
+	while (cur_idx) {
+		eol = sol + idx->v[cur_idx].len;
+
+		if (len == 0) {
+			/* No argument was passed, we want any header.
+			 * To achieve this, we simply build a fake request. */
+			while (sol + len < eol && sol[len] != ':')
+				len++;
+			name = sol;
+		}
+
+		if ((len < eol - sol) &&
+		    (sol[len] == ':') &&
+		    (strncasecmp(sol, name, len) == 0)) {
+			ctx->del = len;
+			sov = sol + len + 1;
+			while (sov < eol && http_is_lws[(unsigned char)*sov])
+				sov++;
+
+			ctx->line = sol;
+			ctx->prev = old_idx;
+			ctx->idx  = cur_idx;
+			ctx->val  = sov - sol;
+			ctx->tws = 0;
+			while (eol > sov && http_is_lws[(unsigned char)*(eol - 1)]) {
+				eol--;
+				ctx->tws++;
+			}
+			ctx->vlen = eol - sov;
+			return 1;
+		}
+	next_hdr:
+		sol = eol + idx->v[cur_idx].cr + 1;
+		old_idx = cur_idx;
+		cur_idx = idx->v[cur_idx].next;
+	}
+	return 0;
+}
+
 /* Find the end of the header value contained between <s> and <e>. See RFC2616,
  * par 2.2 for more information. Note that it requires a valid header to return
  * a valid result. This works for headers defined as comma-separated lists.
@@ -830,7 +899,7 @@ void http_perform_server_redirect(struct session *s, struct stream_interface *si
 	si->state    = SI_ST_CLO;
 
 	/* send the message */
-	http_server_error(s, si, SN_ERR_PRXCOND, SN_FINST_C, 302, &trash);
+	http_server_error(s, si, SN_ERR_LOCAL, SN_FINST_C, 302, &trash);
 
 	/* FIXME: we should increase a counter of redirects per server and per backend. */
 	srv_inc_sess_ctr(srv);
@@ -2073,6 +2142,10 @@ int select_compression_response_header(struct session *s, struct buffer *res)
 	if (!(msg->flags & HTTP_MSGF_TE_CHNK) && msg->body_len == 0)
 		goto fail;
 
+	/* TEMPORARY WORKAROUND: do not compress if response is chunked !!!!!! */
+	if (msg->flags & HTTP_MSGF_TE_CHNK)
+		goto fail;
+
 	/* content is already compressed */
 	ctx.idx = 0;
 	if (http_find_header2("Content-Encoding", 16, res->p, &txn->hdr_idx, &ctx))
@@ -2215,11 +2288,8 @@ int http_wait_for_request(struct session *s, struct channel *req, int an_bit)
 	 * data later, which is much more complicated.
 	 */
 	if (buffer_not_empty(req->buf) && msg->msg_state < HTTP_MSG_ERROR) {
-		if ((txn->flags & TX_NOT_FIRST) &&
-		    unlikely(channel_full(req) ||
-			     bi_end(req->buf) < b_ptr(req->buf, msg->next) ||
-			     bi_end(req->buf) > req->buf->data + req->buf->size - global.tune.maxrewrite)) {
-			if (req->buf->o) {
+		if (txn->flags & TX_NOT_FIRST) {
+			if (unlikely(!channel_reserved(req))) {
 				if (req->flags & (CF_SHUTW|CF_SHUTW_NOW|CF_WRITE_ERROR|CF_WRITE_TIMEOUT))
 					goto failed_keep_alive;
 				/* some data has still not left the buffer, wake us once that's done */
@@ -2227,9 +2297,9 @@ int http_wait_for_request(struct session *s, struct channel *req, int an_bit)
 				req->flags |= CF_READ_DONTWAIT; /* try to get back here ASAP */
 				return 0;
 			}
-			if (bi_end(req->buf) < b_ptr(req->buf, msg->next) ||
-			    bi_end(req->buf) > req->buf->data + req->buf->size - global.tune.maxrewrite)
-				buffer_slow_realign(msg->chn->buf);
+			if (unlikely(bi_end(req->buf) < b_ptr(req->buf, msg->next) ||
+			             bi_end(req->buf) > req->buf->data + req->buf->size - global.tune.maxrewrite))
+				buffer_slow_realign(req->buf);
 		}
 
 		/* Note that we have the same problem with the response ; we
@@ -2240,7 +2310,7 @@ int http_wait_for_request(struct session *s, struct channel *req, int an_bit)
 		 * keep-alive requests.
 		 */
 		if ((txn->flags & TX_NOT_FIRST) &&
-		    unlikely(channel_full(s->rep) ||
+		    unlikely(!channel_reserved(s->rep) ||
 			     bi_end(s->rep->buf) < b_ptr(s->rep->buf, txn->rsp.next) ||
 			     bi_end(s->rep->buf) > s->rep->buf->data + s->rep->buf->size - global.tune.maxrewrite)) {
 			if (s->rep->buf->o) {
@@ -2458,6 +2528,7 @@ int http_wait_for_request(struct session *s, struct channel *req, int an_bit)
 		msg->msg_state = HTTP_MSG_RQBEFORE;
 		req->analysers = 0;
 		s->logs.logwait = 0;
+		s->logs.level = 0;
 		s->rep->flags &= ~CF_EXPECT_MORE; /* speed up sending a previous response */
 		stream_int_retnclose(req->prod, NULL);
 		return 0;
@@ -2528,6 +2599,8 @@ int http_wait_for_request(struct session *s, struct channel *req, int an_bit)
 				/* we fail this request, let's return 503 service unavail */
 				txn->status = 503;
 				stream_int_retnclose(req->prod, http_error_message(s, HTTP_ERR_503));
+				if (!(s->flags & SN_ERR_MASK))
+					s->flags |= SN_ERR_LOCAL; /* we don't want a real error here */
 				goto return_prx_cond;
 			}
 		}
@@ -2535,6 +2608,8 @@ int http_wait_for_request(struct session *s, struct channel *req, int an_bit)
 		/* nothing to fail, let's reply normaly */
 		txn->status = 200;
 		stream_int_retnclose(req->prod, http_error_message(s, HTTP_ERR_200));
+		if (!(s->flags & SN_ERR_MASK))
+			s->flags |= SN_ERR_LOCAL; /* we don't want a real error here */
 		goto return_prx_cond;
 	}
 
@@ -2967,6 +3042,8 @@ int http_handle_stats(struct session *s, struct channel *req)
 
 	/* Was the status page requested with a POST ? */
 	if (unlikely(txn->meth == HTTP_METH_POST)) {
+		char scope_txt[STAT_SCOPE_TXT_MAXLEN + sizeof STAT_SCOPE_PATTERN];
+
 		if (si->applet.ctx.stats.flags & STAT_ADMIN) {
 			if (msg->msg_state < HTTP_MSG_100_SENT) {
 				/* If we have HTTP/1.1 and Expect: 100-continue, then we must
@@ -2989,6 +3066,14 @@ int http_handle_stats(struct session *s, struct channel *req)
 		}
 		else
 			si->applet.ctx.stats.st_code = STAT_STATUS_DENY;
+		/* scope_txt = search pattern + search query, si->applet.ctx.stats.scope_len is always <= STAT_SCOPE_TXT_MAXLEN */
+		scope_txt[0] = 0;
+		if (si->applet.ctx.stats.scope_len) {
+			strcpy(scope_txt, STAT_SCOPE_PATTERN);
+			memcpy(scope_txt + strlen(STAT_SCOPE_PATTERN), bo_ptr(req->buf) + si->applet.ctx.stats.scope_str, si->applet.ctx.stats.scope_len);
+			scope_txt[strlen(STAT_SCOPE_PATTERN) + si->applet.ctx.stats.scope_len] = 0;
+		}
+
 
 		/* We don't want to land on the posted stats page because a refresh will
 		 * repost the data. We don't want this to happen on accident so we redirect
@@ -2999,14 +3084,17 @@ int http_handle_stats(struct session *s, struct channel *req)
 		             "Cache-Control: no-cache\r\n"
 		             "Content-Type: text/plain\r\n"
 		             "Connection: close\r\n"
-		             "Location: %s;st=%s\r\n"
+		             "Location: %s;st=%s%s%s%s\r\n"
 		             "\r\n",
 		             uri->uri_prefix,
 		             ((si->applet.ctx.stats.st_code > STAT_STATUS_INIT) &&
 		              (si->applet.ctx.stats.st_code < STAT_STATUS_SIZE) &&
 		              stat_status_codes[si->applet.ctx.stats.st_code]) ?
 		             stat_status_codes[si->applet.ctx.stats.st_code] :
-		             stat_status_codes[STAT_STATUS_UNKN]);
+		             stat_status_codes[STAT_STATUS_UNKN],
+			     (si->applet.ctx.stats.flags & STAT_HIDE_DOWN) ? ";up" : "",
+			     (si->applet.ctx.stats.flags & STAT_NO_REFRESH) ? ";norefresh" : "",
+			     scope_txt);
 
 		s->txn.status = 303;
 		s->logs.tv_request = now;
@@ -3017,7 +3105,7 @@ int http_handle_stats(struct session *s, struct channel *req)
 			s->fe->fe_counters.intercepted_req++;
 
 		if (!(s->flags & SN_ERR_MASK))      // this is not really an error but it is
-			s->flags |= SN_ERR_PRXCOND; // to mark that it comes from the proxy
+			s->flags |= SN_ERR_LOCAL;   // to mark that it comes from the proxy
 		if (!(s->flags & SN_FINST_MASK))
 			s->flags |= SN_FINST_R;
 		req->analysers = 0;
@@ -3046,7 +3134,7 @@ int http_handle_stats(struct session *s, struct channel *req)
 		s->fe->fe_counters.intercepted_req++;
 
 	if (!(s->flags & SN_ERR_MASK))      // this is not really an error but it is
-		s->flags |= SN_ERR_PRXCOND; // to mark that it comes from the proxy
+		s->flags |= SN_ERR_LOCAL;   // to mark that it comes from the proxy
 	if (!(s->flags & SN_FINST_MASK))
 		s->flags |= SN_FINST_R;
 
@@ -3119,6 +3207,27 @@ http_req_get_intercept_rule(struct proxy *px, struct list *rules, struct session
 		case HTTP_REQ_ACT_REDIR:
 			return rule;
 
+		case HTTP_REQ_ACT_SET_NICE:
+			s->task->nice = rule->arg.nice;
+			break;
+
+		case HTTP_REQ_ACT_SET_TOS:
+#ifdef IP_TOS
+			if (s->req->prod->conn->addr.to.ss_family == AF_INET)
+				setsockopt(s->req->prod->conn->t.sock.fd, IPPROTO_IP, IP_TOS, &rule->arg.tos, sizeof(rule->arg.tos));
+#endif
+			break;
+
+		case HTTP_REQ_ACT_SET_MARK:
+#ifdef SO_MARK
+			setsockopt(s->req->prod->conn->t.sock.fd, SOL_SOCKET, SO_MARK, &rule->arg.mark, sizeof(rule->arg.mark));
+#endif
+			break;
+
+		case HTTP_REQ_ACT_SET_LOGL:
+			s->logs.level = rule->arg.loglevel;
+			break;
+
 		case HTTP_REQ_ACT_SET_HDR:
 			ctx.idx = 0;
 			/* remove all occurrences of the header */
@@ -3136,6 +3245,92 @@ http_req_get_intercept_rule(struct proxy *px, struct list *rules, struct session
 			trash.str[trash.len++] = ' ';
 			trash.len += build_logline(s, trash.str + trash.len, trash.size - trash.len, &rule->arg.hdr_add.fmt);
 			http_header_add_tail2(&txn->req, &txn->hdr_idx, trash.str, trash.len);
+			break;
+		}
+	}
+
+	/* we reached the end of the rules, nothing to report */
+	return NULL;
+}
+
+
+/* Executes the http-response rules <rules> for session <s>, proxy <px> and
+ * transaction <txn>. Returns the first rule that prevents further processing
+ * of the response (deny, ...) or NULL if it executed all rules or stopped
+ * on an allow. It may set the TX_SVDENY on txn->flags if it encounters a deny
+ * rule.
+ */
+static struct http_res_rule *
+http_res_get_intercept_rule(struct proxy *px, struct list *rules, struct session *s, struct http_txn *txn)
+{
+	struct http_res_rule *rule;
+	struct hdr_ctx ctx;
+
+	list_for_each_entry(rule, rules, list) {
+		if (rule->action >= HTTP_RES_ACT_MAX)
+			continue;
+
+		/* check optional condition */
+		if (rule->cond) {
+			int ret;
+
+			ret = acl_exec_cond(rule->cond, px, s, txn, SMP_OPT_DIR_RES|SMP_OPT_FINAL);
+			ret = acl_pass(ret);
+
+			if (rule->cond->pol == ACL_COND_UNLESS)
+				ret = !ret;
+
+			if (!ret) /* condition not matched */
+				continue;
+		}
+
+
+		switch (rule->action) {
+		case HTTP_RES_ACT_ALLOW:
+			return NULL; /* "allow" rules are OK */
+
+		case HTTP_RES_ACT_DENY:
+			txn->flags |= TX_SVDENY;
+			return rule;
+
+		case HTTP_RES_ACT_SET_NICE:
+			s->task->nice = rule->arg.nice;
+			break;
+
+		case HTTP_RES_ACT_SET_TOS:
+#ifdef IP_TOS
+			if (s->req->prod->conn->addr.to.ss_family == AF_INET)
+				setsockopt(s->req->prod->conn->t.sock.fd, IPPROTO_IP, IP_TOS, &rule->arg.tos, sizeof(rule->arg.tos));
+#endif
+			break;
+
+		case HTTP_RES_ACT_SET_MARK:
+#ifdef SO_MARK
+			setsockopt(s->req->prod->conn->t.sock.fd, SOL_SOCKET, SO_MARK, &rule->arg.mark, sizeof(rule->arg.mark));
+#endif
+			break;
+
+		case HTTP_RES_ACT_SET_LOGL:
+			s->logs.level = rule->arg.loglevel;
+			break;
+
+		case HTTP_RES_ACT_SET_HDR:
+			ctx.idx = 0;
+			/* remove all occurrences of the header */
+			while (http_find_header2(rule->arg.hdr_add.name, rule->arg.hdr_add.name_len,
+						 txn->rsp.chn->buf->p, &txn->hdr_idx, &ctx)) {
+				http_remove_header2(&txn->rsp, &txn->hdr_idx, &ctx);
+			}
+			/* now fall through to header addition */
+
+		case HTTP_RES_ACT_ADD_HDR:
+			chunk_printf(&trash, "%s: ", rule->arg.hdr_add.name);
+			memcpy(trash.str, rule->arg.hdr_add.name, rule->arg.hdr_add.name_len);
+			trash.len = rule->arg.hdr_add.name_len;
+			trash.str[trash.len++] = ':';
+			trash.str[trash.len++] = ' ';
+			trash.len += build_logline(s, trash.str + trash.len, trash.size - trash.len, &rule->arg.hdr_add.fmt);
+			http_header_add_tail2(&txn->rsp, &txn->hdr_idx, trash.str, trash.len);
 			break;
 		}
 	}
@@ -3361,7 +3556,7 @@ static int http_apply_redirect_rule(struct redirect_rule *rule, struct session *
 	}
 
 	if (!(s->flags & SN_ERR_MASK))
-		s->flags |= SN_ERR_PRXCOND;
+		s->flags |= SN_ERR_LOCAL;
 	if (!(s->flags & SN_FINST_MASK))
 		s->flags |= SN_FINST_R;
 
@@ -3612,6 +3807,7 @@ int http_process_req_common(struct session *s, struct channel *req, int an_bit, 
 			/* we need more data, let's come back here later */
 			req->analysers |= an_bit;
 			channel_dont_connect(req);
+			return 0;
 		}
 		return 1;
 	}
@@ -4986,20 +5182,18 @@ int http_wait_for_response(struct session *s, struct channel *rep, int an_bit)
 	 * data later, which is much more complicated.
 	 */
 	if (buffer_not_empty(rep->buf) && msg->msg_state < HTTP_MSG_ERROR) {
-		if (unlikely(channel_full(rep) ||
-			     bi_end(rep->buf) < b_ptr(rep->buf, msg->next) ||
-			     bi_end(rep->buf) > rep->buf->data + rep->buf->size - global.tune.maxrewrite)) {
-			if (rep->buf->o) {
-				/* some data has still not left the buffer, wake us once that's done */
-				if (rep->flags & (CF_SHUTW|CF_SHUTW_NOW|CF_WRITE_ERROR|CF_WRITE_TIMEOUT))
-					goto abort_response;
-				channel_dont_close(rep);
-				rep->flags |= CF_READ_DONTWAIT; /* try to get back here ASAP */
-				return 0;
-			}
-			if (rep->buf->i <= rep->buf->size - global.tune.maxrewrite)
-				buffer_slow_realign(msg->chn->buf);
+		if (unlikely(!channel_reserved(rep))) {
+			/* some data has still not left the buffer, wake us once that's done */
+			if (rep->flags & (CF_SHUTW|CF_SHUTW_NOW|CF_WRITE_ERROR|CF_WRITE_TIMEOUT))
+				goto abort_response;
+			channel_dont_close(rep);
+			rep->flags |= CF_READ_DONTWAIT; /* try to get back here ASAP */
+			return 0;
 		}
+
+		if (unlikely(bi_end(rep->buf) < b_ptr(rep->buf, msg->next) ||
+		             bi_end(rep->buf) > rep->buf->data + rep->buf->size - global.tune.maxrewrite))
+			buffer_slow_realign(rep->buf);
 
 		if (likely(msg->next < rep->buf->i))
 			http_msg_analyzer(msg, &txn->hdr_idx);
@@ -5408,6 +5602,7 @@ int http_process_res_common(struct session *t, struct channel *rep, int an_bit, 
 	struct http_msg *msg = &txn->rsp;
 	struct proxy *cur_proxy;
 	struct cond_wordlist *wl;
+	struct http_res_rule *http_res_last_rule = NULL;
 
 	DPRINTF(stderr,"[%u] %s: session=%p b=%p, exp(r,w)=%u,%u bf=%08x bh=%d analysers=%02x\n",
 		now_ms, __FUNCTION__,
@@ -5504,6 +5699,10 @@ int http_process_res_common(struct session *t, struct channel *rep, int an_bit, 
 		cur_proxy = t->be;
 		while (1) {
 			struct proxy *rule_set = cur_proxy;
+
+			/* evaluate http-response rules */
+			if (!http_res_last_rule)
+				http_res_last_rule = http_res_get_intercept_rule(cur_proxy, &cur_proxy->http_res_rules, t, txn);
 
 			/* try headers filters */
 			if (rule_set->rsp_exp != NULL) {
@@ -7823,6 +8022,44 @@ int stats_check_uri(struct stream_interface *si, struct http_txn *txn, struct pr
 		}
 		h++;
 	}
+
+	si->applet.ctx.stats.scope_str = 0;
+	si->applet.ctx.stats.scope_len = 0;
+	h = uri + uri_auth->uri_len;
+	while (h <= uri + msg->sl.rq.u_l - 8) {
+		if (memcmp(h, STAT_SCOPE_INPUT_NAME "=", strlen(STAT_SCOPE_INPUT_NAME) + 1) == 0) {
+			int itx = 0;
+			const char *h2;
+			char scope_txt[STAT_SCOPE_TXT_MAXLEN + 1];
+			const char *err;
+
+			h += strlen(STAT_SCOPE_INPUT_NAME) + 1;
+			h2 = h;
+			si->applet.ctx.stats.scope_str = h2 - msg->chn->buf->p;
+			while (*h != ';' && *h != '\0' && *h != '&' && *h != ' ' && *h != '\n') {
+				itx++;
+				h++;
+			}
+
+			if (itx > STAT_SCOPE_TXT_MAXLEN)
+				itx = STAT_SCOPE_TXT_MAXLEN;
+			si->applet.ctx.stats.scope_len = itx;
+
+			/* scope_txt = search query, si->applet.ctx.stats.scope_len is always <= STAT_SCOPE_TXT_MAXLEN */
+			memcpy(scope_txt, h2, itx);
+			scope_txt[itx] = '\0';
+			err = invalid_char(scope_txt);
+			if (err) {
+				/* bad char in search text => clear scope */
+				si->applet.ctx.stats.scope_str = 0;
+				si->applet.ctx.stats.scope_len = 0;
+			}
+			break;
+		}
+		h++;
+	}
+
+
 	return 1;
 }
 
@@ -7879,7 +8116,8 @@ void http_capture_bad_message(struct error_snapshot *es, struct session *s,
  * <occ> is positive or null, occurrence #occ from the beginning (or last ctx)
  * is returned. Occ #0 and #1 are equivalent. If <occ> is negative (and no less
  * than -MAX_HDR_HISTORY), the occurrence is counted from the last one which is
- * -1.
+ * -1. The value fetch stops at commas, so this function is suited for use with
+ * list headers.
  * The return value is 0 if nothing was found, or non-zero otherwise.
  */
 unsigned int http_get_hdr(const struct http_msg *msg, const char *hname, int hlen,
@@ -7916,6 +8154,72 @@ unsigned int http_get_hdr(const struct http_msg *msg, const char *hname, int hle
 
 	found = hist_ptr = 0;
 	while (http_find_header2(hname, hlen, msg->chn->buf->p, idx, ctx)) {
+		ptr_hist[hist_ptr] = ctx->line + ctx->val;
+		len_hist[hist_ptr] = ctx->vlen;
+		if (++hist_ptr >= MAX_HDR_HISTORY)
+			hist_ptr = 0;
+		found++;
+	}
+	if (-occ > found)
+		return 0;
+	/* OK now we have the last occurrence in [hist_ptr-1], and we need to
+	 * find occurrence -occ. 0 <= hist_ptr < MAX_HDR_HISTORY, and we have
+	 * -10 <= occ <= -1. So we have to check [hist_ptr%MAX_HDR_HISTORY+occ]
+	 * to remain in the 0..9 range.
+	 */
+	hist_ptr += occ + MAX_HDR_HISTORY;
+	if (hist_ptr >= MAX_HDR_HISTORY)
+		hist_ptr -= MAX_HDR_HISTORY;
+	*vptr = ptr_hist[hist_ptr];
+	*vlen = len_hist[hist_ptr];
+	return 1;
+}
+
+/* Return in <vptr> and <vlen> the pointer and length of occurrence <occ> of
+ * header whose name is <hname> of length <hlen>. If <ctx> is null, lookup is
+ * performed over the whole headers. Otherwise it must contain a valid header
+ * context, initialised with ctx->idx=0 for the first lookup in a series. If
+ * <occ> is positive or null, occurrence #occ from the beginning (or last ctx)
+ * is returned. Occ #0 and #1 are equivalent. If <occ> is negative (and no less
+ * than -MAX_HDR_HISTORY), the occurrence is counted from the last one which is
+ * -1. This function differs from http_get_hdr() in that it only returns full
+ * line header values and does not stop at commas.
+ * The return value is 0 if nothing was found, or non-zero otherwise.
+ */
+unsigned int http_get_fhdr(const struct http_msg *msg, const char *hname, int hlen,
+			   struct hdr_idx *idx, int occ,
+			   struct hdr_ctx *ctx, char **vptr, int *vlen)
+{
+	struct hdr_ctx local_ctx;
+	char *ptr_hist[MAX_HDR_HISTORY];
+	int len_hist[MAX_HDR_HISTORY];
+	unsigned int hist_ptr;
+	int found;
+
+	if (!ctx) {
+		local_ctx.idx = 0;
+		ctx = &local_ctx;
+	}
+
+	if (occ >= 0) {
+		/* search from the beginning */
+		while (http_find_full_header2(hname, hlen, msg->chn->buf->p, idx, ctx)) {
+			occ--;
+			if (occ <= 0) {
+				*vptr = ctx->line + ctx->val;
+				*vlen = ctx->vlen;
+				return 1;
+			}
+		}
+		return 0;
+	}
+
+	/* negative occurrence, we scan all the list then walk back */
+	if (-occ > MAX_HDR_HISTORY)
+		return 0;
+
+	found = hist_ptr = 0;
+	while (http_find_full_header2(hname, hlen, msg->chn->buf->p, idx, ctx)) {
 		ptr_hist[hist_ptr] = ctx->line + ctx->val;
 		len_hist[hist_ptr] = ctx->vlen;
 		if (++hist_ptr >= MAX_HDR_HISTORY)
@@ -8048,6 +8352,7 @@ void http_reset_txn(struct session *s)
 
 	s->be = s->fe;
 	s->logs.logwait = s->fe->to_log;
+	s->logs.level = 0;
 	session_del_srv_conn(s);
 	s->target = NULL;
 	/* re-init store persistence */
@@ -8094,6 +8399,7 @@ void free_http_req_rules(struct list *r) {
 	}
 }
 
+/* parse an "http-request" rule */
 struct http_req_rule *parse_http_req_cond(const char **args, const char *file, int linenum, struct proxy *proxy)
 {
 	struct http_req_rule *rule;
@@ -8126,11 +8432,93 @@ struct http_req_rule *parse_http_req_cond(const char **args, const char *file, i
 			} else
 				break;
 		}
+	} else if (!strcmp(args[0], "set-nice")) {
+		rule->action = HTTP_REQ_ACT_SET_NICE;
+		cur_arg = 1;
+
+		if (!*args[cur_arg] ||
+		    (*args[cur_arg + 1] && strcmp(args[cur_arg + 1], "if") != 0 && strcmp(args[cur_arg + 1], "unless") != 0)) {
+			Alert("parsing [%s:%d]: 'http-request %s' expects exactly 1 argument (integer value).\n",
+			      file, linenum, args[0]);
+			goto out_err;
+		}
+		rule->arg.nice = atoi(args[cur_arg]);
+		if (rule->arg.nice < -1024)
+			rule->arg.nice = -1024;
+		else if (rule->arg.nice > 1024)
+			rule->arg.nice = 1024;
+		cur_arg++;
+	} else if (!strcmp(args[0], "set-tos")) {
+#ifdef IP_TOS
+		char *err;
+		rule->action = HTTP_REQ_ACT_SET_TOS;
+		cur_arg = 1;
+
+		if (!*args[cur_arg] ||
+		    (*args[cur_arg + 1] && strcmp(args[cur_arg + 1], "if") != 0 && strcmp(args[cur_arg + 1], "unless") != 0)) {
+			Alert("parsing [%s:%d]: 'http-request %s' expects exactly 1 argument (integer/hex value).\n",
+			      file, linenum, args[0]);
+			goto out_err;
+		}
+
+		rule->arg.tos = strtol(args[cur_arg], &err, 0);
+		if (err && *err != '\0') {
+			Alert("parsing [%s:%d]: invalid character starting at '%s' in 'http-request %s' (integer/hex value expected).\n",
+			      file, linenum, err, args[0]);
+			goto out_err;
+		}
+		cur_arg++;
+#else
+		Alert("parsing [%s:%d]: 'http-request %s' is not supported on this platform (IP_TOS undefined).\n", file, linenum, args[0]);
+		goto out_err;
+#endif
+	} else if (!strcmp(args[0], "set-mark")) {
+#ifdef SO_MARK
+		char *err;
+		rule->action = HTTP_REQ_ACT_SET_MARK;
+		cur_arg = 1;
+
+		if (!*args[cur_arg] ||
+		    (*args[cur_arg + 1] && strcmp(args[cur_arg + 1], "if") != 0 && strcmp(args[cur_arg + 1], "unless") != 0)) {
+			Alert("parsing [%s:%d]: 'http-request %s' expects exactly 1 argument (integer/hex value).\n",
+			      file, linenum, args[0]);
+			goto out_err;
+		}
+
+		rule->arg.mark = strtoul(args[cur_arg], &err, 0);
+		if (err && *err != '\0') {
+			Alert("parsing [%s:%d]: invalid character starting at '%s' in 'http-request %s' (integer/hex value expected).\n",
+			      file, linenum, err, args[0]);
+			goto out_err;
+		}
+		cur_arg++;
+		global.last_checks |= LSTCHK_NETADM;
+#else
+		Alert("parsing [%s:%d]: 'http-request %s' is not supported on this platform (SO_MARK undefined).\n", file, linenum, args[0]);
+		goto out_err;
+#endif
+	} else if (!strcmp(args[0], "set-log-level")) {
+		rule->action = HTTP_REQ_ACT_SET_LOGL;
+		cur_arg = 1;
+
+		if (!*args[cur_arg] ||
+		    (*args[cur_arg + 1] && strcmp(args[cur_arg + 1], "if") != 0 && strcmp(args[cur_arg + 1], "unless") != 0)) {
+		bad_log_level:
+			Alert("parsing [%s:%d]: 'http-request %s' expects exactly 1 argument (log level name or 'silent').\n",
+			      file, linenum, args[0]);
+			goto out_err;
+		}
+		if (strcmp(args[cur_arg], "silent") == 0)
+			rule->arg.loglevel = -1;
+		else if ((rule->arg.loglevel = get_log_level(args[cur_arg]) + 1) == 0)
+			goto bad_log_level;
+		cur_arg++;
 	} else if (strcmp(args[0], "add-header") == 0 || strcmp(args[0], "set-header") == 0) {
 		rule->action = *args[0] == 'a' ? HTTP_REQ_ACT_ADD_HDR : HTTP_REQ_ACT_SET_HDR;
 		cur_arg = 1;
 
-		if (!*args[cur_arg] || !*args[cur_arg+1] || *args[cur_arg+2]) {
+		if (!*args[cur_arg] || !*args[cur_arg+1] ||
+		    (*args[cur_arg+2] && strcmp(args[cur_arg+2], "if") != 0 && strcmp(args[cur_arg+2], "unless") != 0)) {
 			Alert("parsing [%s:%d]: 'http-request %s' expects exactly 2 arguments.\n",
 			      file, linenum, args[0]);
 			goto out_err;
@@ -8164,7 +8552,7 @@ struct http_req_rule *parse_http_req_cond(const char **args, const char *file, i
 		cur_arg = 2;
 		return rule;
 	} else {
-		Alert("parsing [%s:%d]: 'http-request' expects 'allow', 'deny', 'auth', 'redirect', 'tarpit', 'add-header', 'set-header', but got '%s'%s.\n",
+		Alert("parsing [%s:%d]: 'http-request' expects 'allow', 'deny', 'auth', 'redirect', 'tarpit', 'add-header', 'set-header', 'set-nice', 'set-tos', 'set-mark', 'set-log-level', but got '%s'%s.\n",
 		      file, linenum, args[0], *args[0] ? "" : " (missing argument)");
 		goto out_err;
 	}
@@ -8183,6 +8571,155 @@ struct http_req_rule *parse_http_req_cond(const char **args, const char *file, i
 	}
 	else if (*args[cur_arg]) {
 		Alert("parsing [%s:%d]: 'http-request %s' expects 'realm' for 'auth' or"
+		      " either 'if' or 'unless' followed by a condition but found '%s'.\n",
+		      file, linenum, args[0], args[cur_arg]);
+		goto out_err;
+	}
+
+	return rule;
+ out_err:
+	free(rule);
+	return NULL;
+}
+
+/* parse an "http-respose" rule */
+struct http_res_rule *parse_http_res_cond(const char **args, const char *file, int linenum, struct proxy *proxy)
+{
+	struct http_res_rule *rule;
+	int cur_arg;
+
+	rule = calloc(1, sizeof(*rule));
+	if (!rule) {
+		Alert("parsing [%s:%d]: out of memory.\n", file, linenum);
+		goto out_err;
+	}
+
+	if (!strcmp(args[0], "allow")) {
+		rule->action = HTTP_RES_ACT_ALLOW;
+		cur_arg = 1;
+	} else if (!strcmp(args[0], "deny")) {
+		rule->action = HTTP_RES_ACT_DENY;
+		cur_arg = 1;
+	} else if (!strcmp(args[0], "set-nice")) {
+		rule->action = HTTP_RES_ACT_SET_NICE;
+		cur_arg = 1;
+
+		if (!*args[cur_arg] ||
+		    (*args[cur_arg + 1] && strcmp(args[cur_arg + 1], "if") != 0 && strcmp(args[cur_arg + 1], "unless") != 0)) {
+			Alert("parsing [%s:%d]: 'http-response %s' expects exactly 1 argument (integer value).\n",
+			      file, linenum, args[0]);
+			goto out_err;
+		}
+		rule->arg.nice = atoi(args[cur_arg]);
+		if (rule->arg.nice < -1024)
+			rule->arg.nice = -1024;
+		else if (rule->arg.nice > 1024)
+			rule->arg.nice = 1024;
+		cur_arg++;
+	} else if (!strcmp(args[0], "set-tos")) {
+#ifdef IP_TOS
+		char *err;
+		rule->action = HTTP_RES_ACT_SET_TOS;
+		cur_arg = 1;
+
+		if (!*args[cur_arg] ||
+		    (*args[cur_arg + 1] && strcmp(args[cur_arg + 1], "if") != 0 && strcmp(args[cur_arg + 1], "unless") != 0)) {
+			Alert("parsing [%s:%d]: 'http-response %s' expects exactly 1 argument (integer/hex value).\n",
+			      file, linenum, args[0]);
+			goto out_err;
+		}
+
+		rule->arg.tos = strtol(args[cur_arg], &err, 0);
+		if (err && *err != '\0') {
+			Alert("parsing [%s:%d]: invalid character starting at '%s' in 'http-response %s' (integer/hex value expected).\n",
+			      file, linenum, err, args[0]);
+			goto out_err;
+		}
+		cur_arg++;
+#else
+		Alert("parsing [%s:%d]: 'http-response %s' is not supported on this platform (IP_TOS undefined).\n", file, linenum, args[0]);
+		goto out_err;
+#endif
+	} else if (!strcmp(args[0], "set-mark")) {
+#ifdef SO_MARK
+		char *err;
+		rule->action = HTTP_RES_ACT_SET_MARK;
+		cur_arg = 1;
+
+		if (!*args[cur_arg] ||
+		    (*args[cur_arg + 1] && strcmp(args[cur_arg + 1], "if") != 0 && strcmp(args[cur_arg + 1], "unless") != 0)) {
+			Alert("parsing [%s:%d]: 'http-response %s' expects exactly 1 argument (integer/hex value).\n",
+			      file, linenum, args[0]);
+			goto out_err;
+		}
+
+		rule->arg.mark = strtoul(args[cur_arg], &err, 0);
+		if (err && *err != '\0') {
+			Alert("parsing [%s:%d]: invalid character starting at '%s' in 'http-response %s' (integer/hex value expected).\n",
+			      file, linenum, err, args[0]);
+			goto out_err;
+		}
+		cur_arg++;
+		global.last_checks |= LSTCHK_NETADM;
+#else
+		Alert("parsing [%s:%d]: 'http-response %s' is not supported on this platform (SO_MARK undefined).\n", file, linenum, args[0]);
+		goto out_err;
+#endif
+	} else if (!strcmp(args[0], "set-log-level")) {
+		rule->action = HTTP_RES_ACT_SET_LOGL;
+		cur_arg = 1;
+
+		if (!*args[cur_arg] ||
+		    (*args[cur_arg + 1] && strcmp(args[cur_arg + 1], "if") != 0 && strcmp(args[cur_arg + 1], "unless") != 0)) {
+		bad_log_level:
+			Alert("parsing [%s:%d]: 'http-response %s' expects exactly 1 argument (log level name or 'silent').\n",
+			      file, linenum, args[0]);
+			goto out_err;
+		}
+		if (strcmp(args[cur_arg], "silent") == 0)
+			rule->arg.loglevel = -1;
+		else if ((rule->arg.loglevel = get_log_level(args[cur_arg] + 1)) == 0)
+			goto bad_log_level;
+		cur_arg++;
+	} else if (strcmp(args[0], "add-header") == 0 || strcmp(args[0], "set-header") == 0) {
+		rule->action = *args[0] == 'a' ? HTTP_RES_ACT_ADD_HDR : HTTP_RES_ACT_SET_HDR;
+		cur_arg = 1;
+
+		if (!*args[cur_arg] || !*args[cur_arg+1] ||
+		    (*args[cur_arg+2] && strcmp(args[cur_arg+2], "if") != 0 && strcmp(args[cur_arg+2], "unless") != 0)) {
+			Alert("parsing [%s:%d]: 'http-response %s' expects exactly 2 arguments.\n",
+			      file, linenum, args[0]);
+			goto out_err;
+		}
+
+		rule->arg.hdr_add.name = strdup(args[cur_arg]);
+		rule->arg.hdr_add.name_len = strlen(rule->arg.hdr_add.name);
+		LIST_INIT(&rule->arg.hdr_add.fmt);
+
+		proxy->conf.args.ctx = ARGC_HDR;
+		parse_logformat_string(args[cur_arg + 1], proxy, &rule->arg.hdr_add.fmt, 0,
+				       (proxy->cap & PR_CAP_BE) ? SMP_VAL_BE_HRS_HDR : SMP_VAL_FE_HRS_HDR);
+		cur_arg += 2;
+	} else {
+		Alert("parsing [%s:%d]: 'http-response' expects 'allow', 'deny', 'redirect', 'add-header', 'set-header', 'set-nice', 'set-tos', 'set-mark', 'set-log-level', but got '%s'%s.\n",
+		      file, linenum, args[0], *args[0] ? "" : " (missing argument)");
+		goto out_err;
+	}
+
+	if (strcmp(args[cur_arg], "if") == 0 || strcmp(args[cur_arg], "unless") == 0) {
+		struct acl_cond *cond;
+		char *errmsg = NULL;
+
+		if ((cond = build_acl_cond(file, linenum, proxy, args+cur_arg, &errmsg)) == NULL) {
+			Alert("parsing [%s:%d] : error detected while parsing an 'http-response %s' condition : %s.\n",
+			      file, linenum, args[0], errmsg);
+			free(errmsg);
+			goto out_err;
+		}
+		rule->cond = cond;
+	}
+	else if (*args[cur_arg]) {
+		Alert("parsing [%s:%d]: 'http-response %s' expects"
 		      " either 'if' or 'unless' followed by a condition but found '%s'.\n",
 		      file, linenum, args[0], args[cur_arg]);
 		goto out_err;
@@ -8659,6 +9196,95 @@ smp_fetch_url_port(struct proxy *px, struct session *l4, void *l7, unsigned int 
 		l4->flags |= SN_ADDR_SET;
 
 	smp->flags = 0;
+	return 1;
+}
+
+/* Fetch an HTTP header. A pointer to the beginning of the value is returned.
+ * Accepts an optional argument of type string containing the header field name,
+ * and an optional argument of type signed or unsigned integer to request an
+ * explicit occurrence of the header. Note that in the event of a missing name,
+ * headers are considered from the first one. It does not stop on commas and
+ * returns full lines instead (useful for User-Agent or Date for example).
+ */
+static int
+smp_fetch_fhdr(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+               const struct arg *args, struct sample *smp)
+{
+	struct http_txn *txn = l7;
+	struct hdr_idx *idx = &txn->hdr_idx;
+	struct hdr_ctx *ctx = smp->ctx.a[0];
+	const struct http_msg *msg = ((opt & SMP_OPT_DIR) == SMP_OPT_DIR_REQ) ? &txn->req : &txn->rsp;
+	int occ = 0;
+	const char *name_str = NULL;
+	int name_len = 0;
+
+	if (!ctx) {
+		/* first call */
+		ctx = &static_hdr_ctx;
+		ctx->idx = 0;
+		smp->ctx.a[0] = ctx;
+	}
+
+	if (args) {
+		if (args[0].type != ARGT_STR)
+			return 0;
+		name_str = args[0].data.str.str;
+		name_len = args[0].data.str.len;
+
+		if (args[1].type == ARGT_UINT || args[1].type == ARGT_SINT)
+			occ = args[1].data.uint;
+	}
+
+	CHECK_HTTP_MESSAGE_FIRST();
+
+	if (ctx && !(smp->flags & SMP_F_NOT_LAST))
+		/* search for header from the beginning */
+		ctx->idx = 0;
+
+	if (!occ && !(opt & SMP_OPT_ITERATE))
+		/* no explicit occurrence and single fetch => last header by default */
+		occ = -1;
+
+	if (!occ)
+		/* prepare to report multiple occurrences for ACL fetches */
+		smp->flags |= SMP_F_NOT_LAST;
+
+	smp->type = SMP_T_CSTR;
+	smp->flags |= SMP_F_VOL_HDR;
+	if (http_get_fhdr(msg, name_str, name_len, idx, occ, ctx, &smp->data.str.str, &smp->data.str.len))
+		return 1;
+
+	smp->flags &= ~SMP_F_NOT_LAST;
+	return 0;
+}
+
+/* 6. Check on HTTP header count. The number of occurrences is returned.
+ * Accepts exactly 1 argument of type string. It does not stop on commas and
+ * returns full lines instead (useful for User-Agent or Date for example).
+ */
+static int
+smp_fetch_fhdr_cnt(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                  const struct arg *args, struct sample *smp)
+{
+	struct http_txn *txn = l7;
+	struct hdr_idx *idx = &txn->hdr_idx;
+	struct hdr_ctx ctx;
+	const struct http_msg *msg = ((opt & SMP_OPT_DIR) == SMP_OPT_DIR_REQ) ? &txn->req : &txn->rsp;
+	int cnt;
+
+	if (!args || args->type != ARGT_STR)
+		return 0;
+
+	CHECK_HTTP_MESSAGE_FIRST();
+
+	ctx.idx = 0;
+	cnt = 0;
+	while (http_find_full_header2(args->data.str.str, args->data.str.len, msg->chn->buf->p, idx, &ctx))
+		cnt++;
+
+	smp->type = SMP_T_UINT;
+	smp->data.uint = cnt;
+	smp->flags = SMP_F_VOL_HDR;
 	return 1;
 }
 
@@ -9492,31 +10118,23 @@ static struct acl_kw_list acl_kws = {{ },{
 
 	{ "cook",            "req.cook",      acl_parse_str,     acl_match_str     },
 	{ "cook_beg",        "req.cook",      acl_parse_str,     acl_match_beg     },
-	{ "cook_cnt",        "req.cook_cnt",  acl_parse_int,     acl_match_int     },
 	{ "cook_dir",        "req.cook",      acl_parse_str,     acl_match_dir     },
 	{ "cook_dom",        "req.cook",      acl_parse_str,     acl_match_dom     },
 	{ "cook_end",        "req.cook",      acl_parse_str,     acl_match_end     },
 	{ "cook_len",        "req.cook",      acl_parse_int,     acl_match_len     },
 	{ "cook_reg",        "req.cook",      acl_parse_reg,     acl_match_reg     },
 	{ "cook_sub",        "req.cook",      acl_parse_str,     acl_match_sub     },
-	{ "cook_val",        "req.cook_val",  acl_parse_int,     acl_match_int     },
 
 	{ "hdr",             "req.hdr",       acl_parse_str,     acl_match_str     },
 	{ "hdr_beg",         "req.hdr",       acl_parse_str,     acl_match_beg     },
-	{ "hdr_cnt",         "req.hdr_cnt",   acl_parse_int,     acl_match_int     },
 	{ "hdr_dir",         "req.hdr",       acl_parse_str,     acl_match_dir     },
 	{ "hdr_dom",         "req.hdr",       acl_parse_str,     acl_match_dom     },
 	{ "hdr_end",         "req.hdr",       acl_parse_str,     acl_match_end     },
-	{ "hdr_ip",          "req.hdr_ip",    acl_parse_ip,      acl_match_ip      },
 	{ "hdr_len",         "req.hdr",       acl_parse_int,     acl_match_len     },
 	{ "hdr_reg",         "req.hdr",       acl_parse_reg,     acl_match_reg     },
 	{ "hdr_sub",         "req.hdr",       acl_parse_str,     acl_match_sub     },
-	{ "hdr_val",         "req.hdr_val",   acl_parse_int,     acl_match_int     },
 
-	{ "http_auth",       NULL,            acl_parse_nothing, acl_match_nothing },
 	{ "http_auth_group", NULL,            acl_parse_strcat,  acl_match_auth    },
-
-	{ "http_first_req",  NULL,            acl_parse_nothing, acl_match_nothing },
 
 	{ "method",          NULL,            acl_parse_meth,    acl_match_meth    },
 
@@ -9529,43 +10147,33 @@ static struct acl_kw_list acl_kws = {{ },{
 	{ "path_reg",        "path",          acl_parse_reg,     acl_match_reg     },
 	{ "path_sub",        "path",          acl_parse_str,     acl_match_sub     },
 
-	{ "req_proto_http",  "req.proto_http",acl_parse_nothing, acl_match_nothing },
 	{ "req_ver",         "req.ver",       acl_parse_str,     acl_match_str     },
 	{ "resp_ver",        "res.ver",       acl_parse_str,     acl_match_str     },
 
 	{ "scook",           "res.cook",      acl_parse_str,     acl_match_str     },
 	{ "scook_beg",       "res.cook",      acl_parse_str,     acl_match_beg     },
-	{ "scook_cnt",       "res.cook_cnt",  acl_parse_int,     acl_match_int     },
 	{ "scook_dir",       "res.cook",      acl_parse_str,     acl_match_dir     },
 	{ "scook_dom",       "res.cook",      acl_parse_str,     acl_match_dom     },
 	{ "scook_end",       "res.cook",      acl_parse_str,     acl_match_end     },
 	{ "scook_len",       "res.cook",      acl_parse_int,     acl_match_len     },
 	{ "scook_reg",       "res.cook",      acl_parse_reg,     acl_match_reg     },
 	{ "scook_sub",       "res.cook",      acl_parse_str,     acl_match_sub     },
-	{ "scook_val",       "res.cook_val",  acl_parse_int,     acl_match_int     },
 
 	{ "shdr",            "res.hdr",       acl_parse_str,     acl_match_str     },
 	{ "shdr_beg",        "res.hdr",       acl_parse_str,     acl_match_beg     },
-	{ "shdr_cnt",        "res.hdr_cnt",   acl_parse_int,     acl_match_int     },
 	{ "shdr_dir",        "res.hdr",       acl_parse_str,     acl_match_dir     },
 	{ "shdr_dom",        "res.hdr",       acl_parse_str,     acl_match_dom     },
 	{ "shdr_end",        "res.hdr",       acl_parse_str,     acl_match_end     },
-	{ "shdr_ip",         "res.hdr_ip",    acl_parse_ip,      acl_match_ip      },
 	{ "shdr_len",        "res.hdr",       acl_parse_int,     acl_match_len     },
 	{ "shdr_reg",        "res.hdr",       acl_parse_reg,     acl_match_reg     },
 	{ "shdr_sub",        "res.hdr",       acl_parse_str,     acl_match_sub     },
-	{ "shdr_val",        "res.hdr_val",   acl_parse_int,     acl_match_int     },
-
-	{ "status",          NULL,            acl_parse_int,     acl_match_int     },
 
 	{ "url",             "url",           acl_parse_str,     acl_match_str     },
 	{ "url_beg",         "url",           acl_parse_str,     acl_match_beg     },
 	{ "url_dir",         "url",           acl_parse_str,     acl_match_dir     },
 	{ "url_dom",         "url",           acl_parse_str,     acl_match_dom     },
 	{ "url_end",         "url",           acl_parse_str,     acl_match_end     },
-	{ "url_ip",          "url_ip",        acl_parse_ip,      acl_match_ip      },
 	{ "url_len",         "url",           acl_parse_int,     acl_match_len     },
-	{ "url_port",        "url_port",      acl_parse_int,     acl_match_int     },
 	{ "url_reg",         "url",           acl_parse_reg,     acl_match_reg     },
 	{ "url_sub",         "url",           acl_parse_str,     acl_match_sub     },
 
@@ -9574,11 +10182,9 @@ static struct acl_kw_list acl_kws = {{ },{
 	{ "urlp_dir",        "urlp",          acl_parse_str,     acl_match_dir     },
 	{ "urlp_dom",        "urlp",          acl_parse_str,     acl_match_dom     },
 	{ "urlp_end",        "urlp",          acl_parse_str,     acl_match_end     },
-	{ "urlp_ip",         "urlp",          acl_parse_ip,      acl_match_ip      },
 	{ "urlp_len",        "urlp",          acl_parse_int,     acl_match_len     },
 	{ "urlp_reg",        "urlp",          acl_parse_reg,     acl_match_reg     },
 	{ "urlp_sub",        "urlp",          acl_parse_str,     acl_match_sub     },
-	{ "urlp_val",        "urlp_val",      acl_parse_int,     acl_match_int     },
 
 	{ /* END */ },
 }};
@@ -9633,6 +10239,8 @@ static struct sample_fetch_kw_list sample_fetch_keywords = {{ },{
 	{ "req.cook_cnt",    smp_fetch_cookie_cnt,     ARG1(0,STR),      NULL,    SMP_T_UINT, SMP_USE_HRQHV },
 	{ "req.cook_val",    smp_fetch_cookie_val,     ARG1(0,STR),      NULL,    SMP_T_UINT, SMP_USE_HRQHV },
 
+	{ "req.fhdr",        smp_fetch_fhdr,           ARG2(0,STR,SINT), val_hdr, SMP_T_CSTR, SMP_USE_HRQHV },
+	{ "req.fhdr_cnt",    smp_fetch_fhdr_cnt,       ARG1(0,STR),      NULL,    SMP_T_UINT, SMP_USE_HRQHV },
 	{ "req.hdr",         smp_fetch_hdr,            ARG2(0,STR,SINT), val_hdr, SMP_T_CSTR, SMP_USE_HRQHV },
 	{ "req.hdr_cnt",     smp_fetch_hdr_cnt,        ARG1(0,STR),      NULL,    SMP_T_UINT, SMP_USE_HRQHV },
 	{ "req.hdr_ip",      smp_fetch_hdr_ip,         ARG2(0,STR,SINT), val_hdr, SMP_T_IPV4, SMP_USE_HRQHV },
@@ -9643,6 +10251,8 @@ static struct sample_fetch_kw_list sample_fetch_keywords = {{ },{
 	{ "res.cook_cnt",    smp_fetch_cookie_cnt,     ARG1(0,STR),      NULL,    SMP_T_UINT, SMP_USE_HRSHV },
 	{ "res.cook_val",    smp_fetch_cookie_val,     ARG1(0,STR),      NULL,    SMP_T_UINT, SMP_USE_HRSHV },
 
+	{ "res.fhdr",        smp_fetch_fhdr,           ARG2(0,STR,SINT), val_hdr, SMP_T_CSTR, SMP_USE_HRSHV },
+	{ "res.fhdr_cnt",    smp_fetch_fhdr_cnt,       ARG1(0,STR),      NULL,    SMP_T_UINT, SMP_USE_HRSHV },
 	{ "res.hdr",         smp_fetch_hdr,            ARG2(0,STR,SINT), val_hdr, SMP_T_CSTR, SMP_USE_HRSHV },
 	{ "res.hdr_cnt",     smp_fetch_hdr_cnt,        ARG1(0,STR),      NULL,    SMP_T_UINT, SMP_USE_HRSHV },
 	{ "res.hdr_ip",      smp_fetch_hdr_ip,         ARG2(0,STR,SINT), val_hdr, SMP_T_IPV4, SMP_USE_HRSHV },

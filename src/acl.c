@@ -544,6 +544,10 @@ int acl_parse_reg(const char **text, struct acl_pattern *pattern, int *opaque, c
 {
 	regex *preg;
 	int icase;
+#ifdef USE_PCRE_JIT
+	const char *error;
+	int erroffset;
+#endif
 
 	preg = calloc(1, sizeof(*preg));
 
@@ -554,19 +558,19 @@ int acl_parse_reg(const char **text, struct acl_pattern *pattern, int *opaque, c
 
 #ifdef USE_PCRE_JIT
 	icase = (pattern->flags & ACL_PAT_F_IGNORE_CASE) ? PCRE_CASELESS : 0;
-	preg->reg = pcre_compile(*text, PCRE_NO_AUTO_CAPTURE | icase, NULL, NULL,
+	preg->reg = pcre_compile(*text, PCRE_NO_AUTO_CAPTURE | icase, &error, &erroffset,
 		NULL);
 	if (!preg->reg) {
 		free(preg);
-		memprintf(err, "regex '%s' is invalid", *text);
+		memprintf(err, "regex '%s' is invalid (error=%s, erroffset=%d)", *text, error, erroffset);
 		return 0;
 	}
 
-	preg->extra = pcre_study(preg->reg, PCRE_STUDY_JIT_COMPILE, NULL);
+	preg->extra = pcre_study(preg->reg, PCRE_STUDY_JIT_COMPILE, &error);
 	if (!preg->extra) {
 		pcre_free(preg->reg);
 		free(preg);
-		memprintf(err, "failed to compile regex '%s'", *text);
+		memprintf(err, "failed to compile regex '%s' (error=%s)", *text, error);
 		return 0;
 	}
 #else
@@ -1072,6 +1076,27 @@ struct acl_expr *parse_acl_expr(const char **args, char **err, struct arg_list *
 	expr->args = empty_arg_list;
 	expr->smp = aclkw ? aclkw->smp : smp;
 
+	if (!expr->parse) {
+		/* some types can be automatically converted */
+
+		switch (expr->smp->out_type) {
+		case SMP_T_BOOL:
+			expr->parse = acl_parse_fcts[ACL_MATCH_BOOL];
+			expr->match = acl_match_fcts[ACL_MATCH_BOOL];
+			break;
+		case SMP_T_SINT:
+		case SMP_T_UINT:
+			expr->parse = acl_parse_fcts[ACL_MATCH_INT];
+			expr->match = acl_match_fcts[ACL_MATCH_INT];
+			break;
+		case SMP_T_IPV4:
+		case SMP_T_IPV6:
+			expr->parse = acl_parse_fcts[ACL_MATCH_IP];
+			expr->match = acl_match_fcts[ACL_MATCH_IP];
+			break;
+		}
+	}
+
 	arg = strchr(args[0], '(');
 	if (expr->smp->arg_mask) {
 		int nbargs = 0;
@@ -1135,6 +1160,8 @@ struct acl_expr *parse_acl_expr(const char **args, char **err, struct arg_list *
 			expr->args[0].data.str.str = strdup("");
 			expr->args[0].data.str.len = 1;
 			expr->args[0].data.str.len = 0;
+			arg_list_add(al, &expr->args[0], 0);
+
 			expr->args[1].type = ARGT_STOP;
 		}
 		else if (ARGM(expr->smp->arg_mask)) {
@@ -1165,7 +1192,7 @@ struct acl_expr *parse_acl_expr(const char **args, char **err, struct arg_list *
 			patflags |= ACL_PAT_F_IGNORE_CASE;
 		else if ((*args)[1] == 'f') {
 			if (!expr->parse) {
-				memprintf(err, "matching method must be specified first (using '-m') when using a sample fetch ('%s')", expr->kw);
+				memprintf(err, "matching method must be specified first (using '-m') when using a sample fetch of this type ('%s')", expr->kw);
 				goto out_free_expr;
 			}
 
@@ -1222,7 +1249,7 @@ struct acl_expr *parse_acl_expr(const char **args, char **err, struct arg_list *
 	}
 
 	if (!expr->parse) {
-		memprintf(err, "matching method must be specified first (using '-m') when using a sample fetch ('%s')", expr->kw);
+		memprintf(err, "matching method must be specified first (using '-m') when using a sample fetch of this type ('%s')", expr->kw);
 		goto out_free_expr;
 	}
 
@@ -1723,7 +1750,7 @@ int acl_exec_cond(struct acl_cond *cond, struct proxy *px, struct session *l4, v
 					continue;
 				}
 
-				if (smp.type == SMP_T_BOOL) {
+				if (expr->match == acl_match_nothing) {
 					if (smp.data.uint)
 						acl_res |= ACL_PAT_PASS;
 					else
@@ -1953,6 +1980,26 @@ smp_fetch_false(struct proxy *px, struct session *s, void *l7, unsigned int opt,
 	return 1;
 }
 
+/* retrieve environment variable $1 as a string */
+static int
+smp_fetch_env(struct proxy *px, struct session *s, void *l7, unsigned int opt,
+              const struct arg *args, struct sample *smp)
+{
+	char *env;
+
+	if (!args || args[0].type != ARGT_STR)
+		return 0;
+
+	env = getenv(args[0].data.str.str);
+	if (!env)
+		return 0;
+
+	smp->type = SMP_T_CSTR;
+	smp->data.str.str = env;
+	smp->data.str.len = strlen(env);
+	return 1;
+}
+
 
 /************************************************************************/
 /*      All supported sample and ACL keywords must be declared here.    */
@@ -1964,8 +2011,9 @@ smp_fetch_false(struct proxy *px, struct session *s, void *l7, unsigned int opt,
  * instance IPv4/IPv6 must be declared IPv4.
  */
 static struct sample_fetch_kw_list smp_kws = {{ },{
-	{ "always_false", smp_fetch_false, 0, NULL, SMP_T_BOOL, SMP_USE_INTRN },
-	{ "always_true",  smp_fetch_true,  0, NULL, SMP_T_BOOL, SMP_USE_INTRN },
+	{ "always_false", smp_fetch_false, 0,            NULL, SMP_T_BOOL, SMP_USE_INTRN },
+	{ "always_true",  smp_fetch_true,  0,            NULL, SMP_T_BOOL, SMP_USE_INTRN },
+	{ "env",          smp_fetch_env,   ARG1(1,STR),  NULL, SMP_T_CSTR, SMP_USE_INTRN },
 	{ /* END */ },
 }};
 
@@ -1974,8 +2022,6 @@ static struct sample_fetch_kw_list smp_kws = {{ },{
  * Please take care of keeping this list alphabetically sorted.
  */
 static struct acl_kw_list acl_kws = {{ },{
-	{ "always_false", NULL, acl_parse_nothing, acl_match_nothing },
-	{ "always_true",  NULL, acl_parse_nothing, acl_match_nothing },
 	{ /* END */ },
 }};
 

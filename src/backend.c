@@ -884,7 +884,7 @@ int assign_server_and_queue(struct session *s)
  */
 static void assign_tproxy_address(struct session *s)
 {
-#if defined(CONFIG_HAP_CTTPROXY) || defined(CONFIG_HAP_LINUX_TPROXY)
+#if defined(CONFIG_HAP_CTTPROXY) || defined(CONFIG_HAP_TRANSPARENT)
 	struct server *srv = objt_server(s->target);
 	struct conn_src *src;
 
@@ -1599,17 +1599,6 @@ static struct sample_fetch_kw_list smp_kws = {{ },{
  * Please take care of keeping this list alphabetically sorted.
  */
 static struct acl_kw_list acl_kws = {{ },{
-	{ "avg_queue",     NULL, acl_parse_int,     acl_match_int     },
-	{ "be_conn",       NULL, acl_parse_int,     acl_match_int     },
-	{ "be_id",         NULL, acl_parse_int,     acl_match_int     },
-	{ "be_sess_rate",  NULL, acl_parse_int,     acl_match_int     },
-	{ "connslots",     NULL, acl_parse_int,     acl_match_int     },
-	{ "nbsrv",         NULL, acl_parse_int,     acl_match_int     },
-	{ "queue",         NULL, acl_parse_int,     acl_match_int     },
-	{ "srv_conn",      NULL, acl_parse_int,     acl_match_int     },
-	{ "srv_id",        NULL, acl_parse_int,     acl_match_int     },
-	{ "srv_is_up",     NULL, acl_parse_nothing, acl_match_nothing },
-	{ "srv_sess_rate", NULL, acl_parse_int,     acl_match_int     },
 	{ /* END */ },
 }};
 

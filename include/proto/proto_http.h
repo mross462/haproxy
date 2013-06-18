@@ -90,6 +90,9 @@ void manage_server_side_cookies(struct session *t, struct channel *rtr);
 void check_response_for_cacheability(struct session *t, struct channel *rtr);
 int stats_check_uri(struct stream_interface *si, struct http_txn *txn, struct proxy *backend);
 void init_proto_http();
+int http_find_full_header2(const char *name, int len,
+                           char *sol, struct hdr_idx *idx,
+                           struct hdr_ctx *ctx);
 int http_find_header2(const char *name, int len,
 		      char *sol, struct hdr_idx *idx,
 		      struct hdr_ctx *ctx);
@@ -108,6 +111,7 @@ void http_end_txn(struct session *s);
 void http_reset_txn(struct session *s);
 
 struct http_req_rule *parse_http_req_cond(const char **args, const char *file, int linenum, struct proxy *proxy);
+struct http_res_rule *parse_http_res_cond(const char **args, const char *file, int linenum, struct proxy *proxy);
 void free_http_req_rules(struct list *r);
 struct chunk *http_error_message(struct session *s, int msgnum);
 struct redirect_rule *http_parse_redirect_rule(const char *file, int line, struct proxy *curproxy,

@@ -64,6 +64,13 @@
 #define MSG_MORE	0
 #endif
 
+/* On Linux 2.4 and above, MSG_TRUNC can be used on TCP sockets to drop any
+ * pending data. Let's rely on NETFILTER to detect if this is supported.
+ */
+#ifdef NETFILTER
+#define MSG_TRUNC_CLEARS_INPUT
+#endif
+
 /* Maximum path length, OS-dependant */
 #ifndef MAXPATHLEN
 #define MAXPATHLEN 128
@@ -92,6 +99,15 @@
 #define IPV6_TRANSPARENT 75
 #endif /* !IPV6_TRANSPARENT */
 #endif /* CONFIG_HAP_LINUX_TPROXY */
+
+#if defined(IP_FREEBIND)       \
+ || defined(IP_BINDANY)        \
+ || defined(IPV6_BINDANY)      \
+ || defined(SO_BINDANY)        \
+ || defined(IP_TRANSPARENT)    \
+ || defined(IPV6_TRANSPARENT)
+#define CONFIG_HAP_TRANSPARENT
+#endif
 
 /* We'll try to enable SO_REUSEPORT on Linux 2.4 and 2.6 if not defined.
  * There are two families of values depending on the architecture. Those

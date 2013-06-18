@@ -97,10 +97,9 @@ int session_accept(struct listener *l, int cfd, struct sockaddr_storage *addr)
 	 */
 	s->flags = 0;
 	s->logs.logwait = p->to_log;
-	s->stkctr[0].entry = NULL;
-	s->stkctr[1].entry = NULL;
-	s->stkctr[0].table = NULL;
-	s->stkctr[1].table = NULL;
+	s->logs.level = 0;
+
+	memset(s->stkctr, 0, sizeof(s->stkctr));
 
 	s->listener = l;
 	s->fe  = p;
@@ -159,7 +158,8 @@ int session_accept(struct listener *l, int cfd, struct sockaddr_storage *addr)
 		 *  - HEALTH mode without HTTP check => just send "OK"
 		 *  - TCP mode from monitoring address => just close
 		 */
-		recv(cfd, trash.str, trash.size, MSG_DONTWAIT);
+		if (l->proto->drain)
+			l->proto->drain(cfd);
 		if (p->mode == PR_MODE_HTTP ||
 		    (p->mode == PR_MODE_HEALTH && (p->options2 & PR_O2_CHK_ANY) == PR_O2_HTTP_CHK))
 			send(cfd, "HTTP/1.0 200 OK\r\n\r\n", 19, MSG_DONTWAIT|MSG_NOSIGNAL|MSG_MORE);
@@ -2194,21 +2194,22 @@ struct task *process_session(struct task *t)
 			 */
 			if (s->si[1].state != SI_ST_REQ)
 				sess_update_stream_int(s, &s->si[1]);
-			if (s->si[1].state == SI_ST_REQ)
+			if (s->si[1].state == SI_ST_REQ) {
 				sess_prepare_conn_req(s, &s->si[1]);
+
+				/* Now we can add the server name to a header (if requested) */
+				/* check for HTTP mode and proxy server_name_hdr_name != NULL */
+				if ((s->flags & SN_BE_ASSIGNED) &&
+				    (s->be->mode == PR_MODE_HTTP) &&
+				    (s->be->server_id_hdr_name != NULL)) {
+					http_send_name_header(&s->txn, s->be, objt_server(s->target)->id);
+				}
+			}
 
 			srv = objt_server(s->target);
 			if (s->si[1].state == SI_ST_ASS && srv && srv->rdr_len && (s->flags & SN_REDIRECTABLE))
 				http_perform_server_redirect(s, &s->si[1]);
 		} while (s->si[1].state == SI_ST_ASS);
-
-		/* Now we can add the server name to a header (if requested) */
-		/* check for HTTP mode and proxy server_name_hdr_name != NULL */
-		if ((s->flags & SN_BE_ASSIGNED) &&
-		    (s->be->mode == PR_MODE_HTTP) &&
-		    (s->be->server_id_hdr_name != NULL)) {
-			http_send_name_header(&s->txn, s->be, objt_server(s->target)->id);
-		}
 	}
 
 	/* Benchmarks have shown that it's optimal to do a full resync now */
@@ -2576,6 +2577,39 @@ void session_shutdown(struct session *session, int why)
 /*           All supported ACL keywords must be declared here.          */
 /************************************************************************/
 
+/* set return a boolean indicating if sc0 is currently being tracked or not */
+static int
+smp_fetch_sc0_tracked(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                      const struct arg *args, struct sample *smp)
+{
+	smp->flags = SMP_F_VOL_TEST;
+	smp->type = SMP_T_BOOL;
+	smp->data.uint = !!l4->stkctr[0].entry;
+	return 1;
+}
+
+/* set return a boolean indicating if sc1 is currently being tracked or not */
+static int
+smp_fetch_sc1_tracked(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                      const struct arg *args, struct sample *smp)
+{
+	smp->flags = SMP_F_VOL_TEST;
+	smp->type = SMP_T_BOOL;
+	smp->data.uint = !!l4->stkctr[1].entry;
+	return 1;
+}
+
+/* set return a boolean indicating if sc2 is currently being tracked or not */
+static int
+smp_fetch_sc2_tracked(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                      const struct arg *args, struct sample *smp)
+{
+	smp->flags = SMP_F_VOL_TEST;
+	smp->type = SMP_T_BOOL;
+	smp->data.uint = !!l4->stkctr[2].entry;
+	return 1;
+}
+
 /* set temp integer to the General Purpose Counter 0 value in the stksess entry <ts> */
 static int
 smp_fetch_get_gpc0(struct stktable *table, struct sample *smp, struct stksess *ts)
@@ -2596,7 +2630,7 @@ smp_fetch_get_gpc0(struct stktable *table, struct sample *smp, struct stksess *t
  * frontend counters.
  */
 static int
-smp_fetch_sc1_get_gpc0(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+smp_fetch_sc0_get_gpc0(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                        const struct arg *args, struct sample *smp)
 {
 	if (!l4->stkctr[0].entry)
@@ -2608,12 +2642,24 @@ smp_fetch_sc1_get_gpc0(struct proxy *px, struct session *l4, void *l7, unsigned 
  * backend counters.
  */
 static int
-smp_fetch_sc2_get_gpc0(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+smp_fetch_sc1_get_gpc0(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                        const struct arg *args, struct sample *smp)
 {
 	if (!l4->stkctr[1].entry)
 		return 0;
 	return smp_fetch_get_gpc0(l4->stkctr[1].table, smp, l4->stkctr[1].entry);
+}
+
+/* set temp integer to the General Purpose Counter 0 value from the session's tracked
+ * backend counters.
+ */
+static int
+smp_fetch_sc2_get_gpc0(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                       const struct arg *args, struct sample *smp)
+{
+	if (!l4->stkctr[2].entry)
+		return 0;
+	return smp_fetch_get_gpc0(l4->stkctr[2].table, smp, l4->stkctr[2].entry);
 }
 
 /* set temp integer to the General Purpose Counter 0 value from the session's source
@@ -2634,6 +2680,77 @@ smp_fetch_src_get_gpc0(struct proxy *px, struct session *l4, void *l7, unsigned 
 	return smp_fetch_get_gpc0(&px->table, smp, stktable_lookup_key(&px->table, key));
 }
 
+/* set temp integer to the General Purpose Counter 0's event rate in the stksess entry <ts> */
+static int
+smp_fetch_gpc0_rate(struct stktable *table, struct sample *smp, struct stksess *ts)
+{
+	smp->flags = SMP_F_VOL_TEST;
+	smp->type = SMP_T_UINT;
+	smp->data.uint = 0;
+	if (ts != NULL) {
+		void *ptr = stktable_data_ptr(table, ts, STKTABLE_DT_GPC0_RATE);
+		if (!ptr)
+			return 0; /* parameter not stored */
+		smp->data.uint = read_freq_ctr_period(&stktable_data_cast(ptr, gpc0_rate),
+					       table->data_arg[STKTABLE_DT_GPC0_RATE].u);
+	}
+	return 1;
+}
+
+/* set temp integer to the General Purpose Counter 0's event rate from the
+ * session's tracked frontend counters.
+ */
+static int
+smp_fetch_sc0_gpc0_rate(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                       const struct arg *args, struct sample *smp)
+{
+	if (!l4->stkctr[0].entry)
+		return 0;
+	return smp_fetch_gpc0_rate(l4->stkctr[0].table, smp, l4->stkctr[0].entry);
+}
+
+/* set temp integer to the General Purpose Counter 0's event rate from the
+ * session's tracked backend counters.
+ */
+static int
+smp_fetch_sc1_gpc0_rate(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                       const struct arg *args, struct sample *smp)
+{
+	if (!l4->stkctr[1].entry)
+		return 0;
+	return smp_fetch_gpc0_rate(l4->stkctr[1].table, smp, l4->stkctr[1].entry);
+}
+
+/* set temp integer to the General Purpose Counter 0's event rate from the
+ * session's tracked backend counters.
+ */
+static int
+smp_fetch_sc2_gpc0_rate(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                       const struct arg *args, struct sample *smp)
+{
+	if (!l4->stkctr[2].entry)
+		return 0;
+	return smp_fetch_gpc0_rate(l4->stkctr[2].table, smp, l4->stkctr[2].entry);
+}
+
+/* set temp integer to the General Purpose Counter 0's event rate from the
+ * session's source address in the table pointed to by expr.
+ * Accepts exactly 1 argument of type table.
+ */
+static int
+smp_fetch_src_gpc0_rate(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                       const struct arg *args, struct sample *smp)
+{
+	struct stktable_key *key;
+
+	key = addr_to_stktable_key(&l4->si[0].conn->addr.from);
+	if (!key)
+		return 0;
+
+	px = args->data.prx;
+	return smp_fetch_gpc0_rate(&px->table, smp, stktable_lookup_key(&px->table, key));
+}
+
 /* Increment the General Purpose Counter 0 value in the stksess entry <ts> and
  * return it into temp integer.
  */
@@ -2644,10 +2761,22 @@ smp_fetch_inc_gpc0(struct stktable *table, struct sample *smp, struct stksess *t
 	smp->type = SMP_T_UINT;
 	smp->data.uint = 0;
 	if (ts != NULL) {
-		void *ptr = stktable_data_ptr(table, ts, STKTABLE_DT_GPC0);
-		if (!ptr)
-			return 0; /* parameter not stored */
-		smp->data.uint = ++stktable_data_cast(ptr, gpc0);
+		void *ptr;
+
+		/* First, update gpc0_rate if it's tracked. Second, update its
+		 * gpc0 if tracked. Returns gpc0's value otherwise the curr_ctr.
+		 */
+		ptr = stktable_data_ptr(table, ts, STKTABLE_DT_GPC0_RATE);
+		if (ptr) {
+			update_freq_ctr_period(&stktable_data_cast(ptr, gpc0_rate),
+					       table->data_arg[STKTABLE_DT_GPC0_RATE].u, 1);
+			smp->data.uint = (&stktable_data_cast(ptr, gpc0_rate))->curr_ctr;
+		}
+
+		ptr = stktable_data_ptr(table, ts, STKTABLE_DT_GPC0);
+		if (ptr)
+			smp->data.uint = ++stktable_data_cast(ptr, gpc0);
+
 	}
 	return 1;
 }
@@ -2656,7 +2785,7 @@ smp_fetch_inc_gpc0(struct stktable *table, struct sample *smp, struct stksess *t
  * frontend counters and return it into temp integer.
  */
 static int
-smp_fetch_sc1_inc_gpc0(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+smp_fetch_sc0_inc_gpc0(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                        const struct arg *args, struct sample *smp)
 {
 	if (!l4->stkctr[0].entry)
@@ -2668,12 +2797,24 @@ smp_fetch_sc1_inc_gpc0(struct proxy *px, struct session *l4, void *l7, unsigned 
  * backend counters and return it into temp integer.
  */
 static int
-smp_fetch_sc2_inc_gpc0(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+smp_fetch_sc1_inc_gpc0(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                        const struct arg *args, struct sample *smp)
 {
 	if (!l4->stkctr[1].entry)
 		return 0;
 	return smp_fetch_inc_gpc0(l4->stkctr[1].table, smp, l4->stkctr[1].entry);
+}
+
+/* Increment the General Purpose Counter 0 value from the session's tracked
+ * backend counters and return it into temp integer.
+ */
+static int
+smp_fetch_sc2_inc_gpc0(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                       const struct arg *args, struct sample *smp)
+{
+	if (!l4->stkctr[2].entry)
+		return 0;
+	return smp_fetch_inc_gpc0(l4->stkctr[2].table, smp, l4->stkctr[2].entry);
 }
 
 /* Increment the General Purpose Counter 0 value from the session's source
@@ -2717,7 +2858,7 @@ smp_fetch_clr_gpc0(struct stktable *table, struct sample *smp, struct stksess *t
  * frontend counters and return its previous value into temp integer.
  */
 static int
-smp_fetch_sc1_clr_gpc0(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+smp_fetch_sc0_clr_gpc0(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                        const struct arg *args, struct sample *smp)
 {
 	if (!l4->stkctr[0].entry)
@@ -2729,12 +2870,24 @@ smp_fetch_sc1_clr_gpc0(struct proxy *px, struct session *l4, void *l7, unsigned 
  * backend counters and return its previous value into temp integer.
  */
 static int
-smp_fetch_sc2_clr_gpc0(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+smp_fetch_sc1_clr_gpc0(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                        const struct arg *args, struct sample *smp)
 {
 	if (!l4->stkctr[1].entry)
 		return 0;
 	return smp_fetch_clr_gpc0(l4->stkctr[1].table, smp, l4->stkctr[1].entry);
+}
+
+/* Clear the General Purpose Counter 0 value from the session's tracked
+ * backend counters and return its previous value into temp integer.
+ */
+static int
+smp_fetch_sc2_clr_gpc0(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                       const struct arg *args, struct sample *smp)
+{
+	if (!l4->stkctr[2].entry)
+		return 0;
+	return smp_fetch_clr_gpc0(l4->stkctr[2].table, smp, l4->stkctr[2].entry);
 }
 
 /* Clear the General Purpose Counter 0 value from the session's source address
@@ -2773,7 +2926,7 @@ smp_fetch_conn_cnt(struct stktable *table, struct sample *smp, struct stksess *t
 
 /* set temp integer to the cumulated number of connections from the session's tracked FE counters */
 static int
-smp_fetch_sc1_conn_cnt(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+smp_fetch_sc0_conn_cnt(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                        const struct arg *args, struct sample *smp)
 {
 	if (!l4->stkctr[0].entry)
@@ -2784,13 +2937,24 @@ smp_fetch_sc1_conn_cnt(struct proxy *px, struct session *l4, void *l7, unsigned 
 
 /* set temp integer to the cumulated number of connections from the session's tracked BE counters */
 static int
-smp_fetch_sc2_conn_cnt(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+smp_fetch_sc1_conn_cnt(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                        const struct arg *args, struct sample *smp)
 {
 	if (!l4->stkctr[1].entry)
 		return 0;
 
 	return smp_fetch_conn_cnt(l4->stkctr[1].table, smp, l4->stkctr[1].entry);
+}
+
+/* set temp integer to the cumulated number of connections from the session's tracked BE counters */
+static int
+smp_fetch_sc2_conn_cnt(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                       const struct arg *args, struct sample *smp)
+{
+	if (!l4->stkctr[2].entry)
+		return 0;
+
+	return smp_fetch_conn_cnt(l4->stkctr[2].table, smp, l4->stkctr[2].entry);
 }
 
 /* set temp integer to the cumulated number of connections from the session's source
@@ -2832,7 +2996,7 @@ smp_fetch_conn_rate(struct stktable *table, struct sample *smp, struct stksess *
  * the configured period.
  */
 static int
-smp_fetch_sc1_conn_rate(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+smp_fetch_sc0_conn_rate(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                         const struct arg *args, struct sample *smp)
 {
 	if (!l4->stkctr[0].entry)
@@ -2845,13 +3009,26 @@ smp_fetch_sc1_conn_rate(struct proxy *px, struct session *l4, void *l7, unsigned
  * the configured period.
  */
 static int
-smp_fetch_sc2_conn_rate(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+smp_fetch_sc1_conn_rate(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                         const struct arg *args, struct sample *smp)
 {
 	if (!l4->stkctr[1].entry)
 		return 0;
 
 	return smp_fetch_conn_rate(l4->stkctr[1].table, smp, l4->stkctr[1].entry);
+}
+
+/* set temp integer to the connection rate from the session's tracked BE counters over
+ * the configured period.
+ */
+static int
+smp_fetch_sc2_conn_rate(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                        const struct arg *args, struct sample *smp)
+{
+	if (!l4->stkctr[2].entry)
+		return 0;
+
+	return smp_fetch_conn_rate(l4->stkctr[2].table, smp, l4->stkctr[2].entry);
 }
 
 /* set temp integer to the connection rate from the session's source address in the
@@ -2923,7 +3100,7 @@ smp_fetch_conn_cur(struct stktable *table, struct sample *smp, struct stksess *t
 
 /* set temp integer to the number of concurrent connections from the session's tracked FE counters */
 static int
-smp_fetch_sc1_conn_cur(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+smp_fetch_sc0_conn_cur(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                        const struct arg *args, struct sample *smp)
 {
 	if (!l4->stkctr[0].entry)
@@ -2934,13 +3111,24 @@ smp_fetch_sc1_conn_cur(struct proxy *px, struct session *l4, void *l7, unsigned 
 
 /* set temp integer to the number of concurrent connections from the session's tracked BE counters */
 static int
-smp_fetch_sc2_conn_cur(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+smp_fetch_sc1_conn_cur(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                        const struct arg *args, struct sample *smp)
 {
 	if (!l4->stkctr[1].entry)
 		return 0;
 
 	return smp_fetch_conn_cur(l4->stkctr[1].table, smp, l4->stkctr[1].entry);
+}
+
+/* set temp integer to the number of concurrent connections from the session's tracked BE counters */
+static int
+smp_fetch_sc2_conn_cur(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                       const struct arg *args, struct sample *smp)
+{
+	if (!l4->stkctr[2].entry)
+		return 0;
+
+	return smp_fetch_conn_cur(l4->stkctr[2].table, smp, l4->stkctr[2].entry);
 }
 
 /* set temp integer to the number of concurrent connections from the session's source
@@ -2979,7 +3167,7 @@ smp_fetch_sess_cnt(struct stktable *table, struct sample *smp, struct stksess *t
 
 /* set temp integer to the cumulated number of sessions from the session's tracked FE counters */
 static int
-smp_fetch_sc1_sess_cnt(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+smp_fetch_sc0_sess_cnt(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                        const struct arg *args, struct sample *smp)
 {
 	if (!l4->stkctr[0].entry)
@@ -2990,13 +3178,24 @@ smp_fetch_sc1_sess_cnt(struct proxy *px, struct session *l4, void *l7, unsigned 
 
 /* set temp integer to the cumulated number of sessions from the session's tracked BE counters */
 static int
-smp_fetch_sc2_sess_cnt(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+smp_fetch_sc1_sess_cnt(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                        const struct arg *args, struct sample *smp)
 {
 	if (!l4->stkctr[1].entry)
 		return 0;
 
 	return smp_fetch_sess_cnt(l4->stkctr[1].table, smp, l4->stkctr[1].entry);
+}
+
+/* set temp integer to the cumulated number of sessions from the session's tracked BE counters */
+static int
+smp_fetch_sc2_sess_cnt(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                       const struct arg *args, struct sample *smp)
+{
+	if (!l4->stkctr[2].entry)
+		return 0;
+
+	return smp_fetch_sess_cnt(l4->stkctr[2].table, smp, l4->stkctr[2].entry);
 }
 
 /* set temp integer to the cumulated number of session from the session's source
@@ -3038,7 +3237,7 @@ smp_fetch_sess_rate(struct stktable *table, struct sample *smp, struct stksess *
  * the configured period.
  */
 static int
-smp_fetch_sc1_sess_rate(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+smp_fetch_sc0_sess_rate(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                         const struct arg *args, struct sample *smp)
 {
 	if (!l4->stkctr[0].entry)
@@ -3051,13 +3250,26 @@ smp_fetch_sc1_sess_rate(struct proxy *px, struct session *l4, void *l7, unsigned
  * the configured period.
  */
 static int
-smp_fetch_sc2_sess_rate(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+smp_fetch_sc1_sess_rate(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                         const struct arg *args, struct sample *smp)
 {
 	if (!l4->stkctr[1].entry)
 		return 0;
 
 	return smp_fetch_sess_rate(l4->stkctr[1].table, smp, l4->stkctr[1].entry);
+}
+
+/* set temp integer to the session rate from the session's tracked BE counters over
+ * the configured period.
+ */
+static int
+smp_fetch_sc2_sess_rate(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                        const struct arg *args, struct sample *smp)
+{
+	if (!l4->stkctr[2].entry)
+		return 0;
+
+	return smp_fetch_sess_rate(l4->stkctr[2].table, smp, l4->stkctr[2].entry);
 }
 
 /* set temp integer to the session rate from the session's source address in the
@@ -3096,7 +3308,7 @@ smp_fetch_http_req_cnt(struct stktable *table, struct sample *smp, struct stkses
 
 /* set temp integer to the cumulated number of sessions from the session's tracked FE counters */
 static int
-smp_fetch_sc1_http_req_cnt(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+smp_fetch_sc0_http_req_cnt(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                            const struct arg *args, struct sample *smp)
 {
 	if (!l4->stkctr[0].entry)
@@ -3107,13 +3319,24 @@ smp_fetch_sc1_http_req_cnt(struct proxy *px, struct session *l4, void *l7, unsig
 
 /* set temp integer to the cumulated number of sessions from the session's tracked BE counters */
 static int
-smp_fetch_sc2_http_req_cnt(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+smp_fetch_sc1_http_req_cnt(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                            const struct arg *args, struct sample *smp)
 {
 	if (!l4->stkctr[1].entry)
 		return 0;
 
 	return smp_fetch_http_req_cnt(l4->stkctr[1].table, smp, l4->stkctr[1].entry);
+}
+
+/* set temp integer to the cumulated number of sessions from the session's tracked BE counters */
+static int
+smp_fetch_sc2_http_req_cnt(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                           const struct arg *args, struct sample *smp)
+{
+	if (!l4->stkctr[2].entry)
+		return 0;
+
+	return smp_fetch_http_req_cnt(l4->stkctr[2].table, smp, l4->stkctr[2].entry);
 }
 
 /* set temp integer to the cumulated number of session from the session's source
@@ -3155,7 +3378,7 @@ smp_fetch_http_req_rate(struct stktable *table, struct sample *smp, struct stkse
  * the configured period.
  */
 static int
-smp_fetch_sc1_http_req_rate(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+smp_fetch_sc0_http_req_rate(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                             const struct arg *args, struct sample *smp)
 {
 	if (!l4->stkctr[0].entry)
@@ -3168,13 +3391,26 @@ smp_fetch_sc1_http_req_rate(struct proxy *px, struct session *l4, void *l7, unsi
  * the configured period.
  */
 static int
-smp_fetch_sc2_http_req_rate(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+smp_fetch_sc1_http_req_rate(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                             const struct arg *args, struct sample *smp)
 {
 	if (!l4->stkctr[1].entry)
 		return 0;
 
 	return smp_fetch_http_req_rate(l4->stkctr[1].table, smp, l4->stkctr[1].entry);
+}
+
+/* set temp integer to the session rate from the session's tracked BE counters over
+ * the configured period.
+ */
+static int
+smp_fetch_sc2_http_req_rate(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                            const struct arg *args, struct sample *smp)
+{
+	if (!l4->stkctr[2].entry)
+		return 0;
+
+	return smp_fetch_http_req_rate(l4->stkctr[2].table, smp, l4->stkctr[2].entry);
 }
 
 /* set temp integer to the session rate from the session's source address in the
@@ -3213,7 +3449,7 @@ smp_fetch_http_err_cnt(struct stktable *table, struct sample *smp, struct stkses
 
 /* set temp integer to the cumulated number of sessions from the session's tracked FE counters */
 static int
-smp_fetch_sc1_http_err_cnt(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+smp_fetch_sc0_http_err_cnt(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                            const struct arg *args, struct sample *smp)
 {
 	if (!l4->stkctr[0].entry)
@@ -3224,13 +3460,24 @@ smp_fetch_sc1_http_err_cnt(struct proxy *px, struct session *l4, void *l7, unsig
 
 /* set temp integer to the cumulated number of sessions from the session's tracked BE counters */
 static int
-smp_fetch_sc2_http_err_cnt(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+smp_fetch_sc1_http_err_cnt(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                            const struct arg *args, struct sample *smp)
 {
 	if (!l4->stkctr[1].entry)
 		return 0;
 
 	return smp_fetch_http_err_cnt(l4->stkctr[1].table, smp, l4->stkctr[1].entry);
+}
+
+/* set temp integer to the cumulated number of sessions from the session's tracked BE counters */
+static int
+smp_fetch_sc2_http_err_cnt(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                           const struct arg *args, struct sample *smp)
+{
+	if (!l4->stkctr[2].entry)
+		return 0;
+
+	return smp_fetch_http_err_cnt(l4->stkctr[2].table, smp, l4->stkctr[2].entry);
 }
 
 /* set temp integer to the cumulated number of session from the session's source
@@ -3272,7 +3519,7 @@ smp_fetch_http_err_rate(struct stktable *table, struct sample *smp, struct stkse
  * the configured period.
  */
 static int
-smp_fetch_sc1_http_err_rate(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+smp_fetch_sc0_http_err_rate(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                             const struct arg *args, struct sample *smp)
 {
 	if (!l4->stkctr[0].entry)
@@ -3285,13 +3532,26 @@ smp_fetch_sc1_http_err_rate(struct proxy *px, struct session *l4, void *l7, unsi
  * the configured period.
  */
 static int
-smp_fetch_sc2_http_err_rate(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+smp_fetch_sc1_http_err_rate(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                             const struct arg *args, struct sample *smp)
 {
 	if (!l4->stkctr[1].entry)
 		return 0;
 
 	return smp_fetch_http_err_rate(l4->stkctr[1].table, smp, l4->stkctr[1].entry);
+}
+
+/* set temp integer to the session rate from the session's tracked BE counters over
+ * the configured period.
+ */
+static int
+smp_fetch_sc2_http_err_rate(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                            const struct arg *args, struct sample *smp)
+{
+	if (!l4->stkctr[2].entry)
+		return 0;
+
+	return smp_fetch_http_err_rate(l4->stkctr[2].table, smp, l4->stkctr[2].entry);
 }
 
 /* set temp integer to the session rate from the session's source address in the
@@ -3333,7 +3593,7 @@ smp_fetch_kbytes_in(struct stktable *table, struct sample *smp, struct stksess *
  * session's tracked FE counters.
  */
 static int
-smp_fetch_sc1_kbytes_in(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+smp_fetch_sc0_kbytes_in(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                         const struct arg *args, struct sample *smp)
 {
 	if (!l4->stkctr[0].entry)
@@ -3346,13 +3606,26 @@ smp_fetch_sc1_kbytes_in(struct proxy *px, struct session *l4, void *l7, unsigned
  * session's tracked BE counters.
  */
 static int
-smp_fetch_sc2_kbytes_in(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+smp_fetch_sc1_kbytes_in(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                         const struct arg *args, struct sample *smp)
 {
 	if (!l4->stkctr[1].entry)
 		return 0;
 
 	return smp_fetch_kbytes_in(l4->stkctr[1].table, smp, l4->stkctr[1].entry);
+}
+
+/* set temp integer to the number of kbytes received from clients according to the
+ * session's tracked BE counters.
+ */
+static int
+smp_fetch_sc2_kbytes_in(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                        const struct arg *args, struct sample *smp)
+{
+	if (!l4->stkctr[2].entry)
+		return 0;
+
+	return smp_fetch_kbytes_in(l4->stkctr[2].table, smp, l4->stkctr[2].entry);
 }
 
 /* set temp integer to the number of kbytes received from the session's source
@@ -3396,7 +3669,7 @@ smp_fetch_bytes_in_rate(struct stktable *table, struct sample *smp, struct stkse
  * counters over the configured period.
  */
 static int
-smp_fetch_sc1_bytes_in_rate(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+smp_fetch_sc0_bytes_in_rate(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                             const struct arg *args, struct sample *smp)
 {
 	if (!l4->stkctr[0].entry)
@@ -3409,13 +3682,26 @@ smp_fetch_sc1_bytes_in_rate(struct proxy *px, struct session *l4, void *l7, unsi
  * counters over the configured period.
  */
 static int
-smp_fetch_sc2_bytes_in_rate(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+smp_fetch_sc1_bytes_in_rate(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                             const struct arg *args, struct sample *smp)
 {
 	if (!l4->stkctr[1].entry)
 		return 0;
 
 	return smp_fetch_bytes_in_rate(l4->stkctr[1].table, smp, l4->stkctr[1].entry);
+}
+
+/* set temp integer to the bytes rate from clients from the session's tracked BE
+ * counters over the configured period.
+ */
+static int
+smp_fetch_sc2_bytes_in_rate(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                            const struct arg *args, struct sample *smp)
+{
+	if (!l4->stkctr[2].entry)
+		return 0;
+
+	return smp_fetch_bytes_in_rate(l4->stkctr[2].table, smp, l4->stkctr[2].entry);
 }
 
 /* set temp integer to the bytes rate from clients from the session's source address
@@ -3457,7 +3743,7 @@ smp_fetch_kbytes_out(struct stktable *table, struct sample *smp, struct stksess 
  * tracked FE counters.
  */
 static int
-smp_fetch_sc1_kbytes_out(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+smp_fetch_sc0_kbytes_out(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                          const struct arg *args, struct sample *smp)
 {
 	if (!l4->stkctr[0].entry)
@@ -3470,13 +3756,26 @@ smp_fetch_sc1_kbytes_out(struct proxy *px, struct session *l4, void *l7, unsigne
  * tracked BE counters.
  */
 static int
-smp_fetch_sc2_kbytes_out(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+smp_fetch_sc1_kbytes_out(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                          const struct arg *args, struct sample *smp)
 {
 	if (!l4->stkctr[1].entry)
 		return 0;
 
 	return smp_fetch_kbytes_out(l4->stkctr[1].table, smp, l4->stkctr[1].entry);
+}
+
+/* set temp integer to the number of kbytes sent to clients according to the session's
+ * tracked BE counters.
+ */
+static int
+smp_fetch_sc2_kbytes_out(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                         const struct arg *args, struct sample *smp)
+{
+	if (!l4->stkctr[2].entry)
+		return 0;
+
+	return smp_fetch_kbytes_out(l4->stkctr[2].table, smp, l4->stkctr[2].entry);
 }
 
 /* set temp integer to the number of kbytes sent to the session's source address in
@@ -3520,7 +3819,7 @@ smp_fetch_bytes_out_rate(struct stktable *table, struct sample *smp, struct stks
  * over the configured period.
  */
 static int
-smp_fetch_sc1_bytes_out_rate(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+smp_fetch_sc0_bytes_out_rate(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                              const struct arg *args, struct sample *smp)
 {
 	if (!l4->stkctr[0].entry)
@@ -3533,13 +3832,26 @@ smp_fetch_sc1_bytes_out_rate(struct proxy *px, struct session *l4, void *l7, uns
  * over the configured period.
  */
 static int
-smp_fetch_sc2_bytes_out_rate(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+smp_fetch_sc1_bytes_out_rate(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                              const struct arg *args, struct sample *smp)
 {
 	if (!l4->stkctr[1].entry)
 		return 0;
 
 	return smp_fetch_bytes_out_rate(l4->stkctr[1].table, smp, l4->stkctr[1].entry);
+}
+
+/* set temp integer to the bytes rate to clients from the session's tracked BE counters
+ * over the configured period.
+ */
+static int
+smp_fetch_sc2_bytes_out_rate(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                             const struct arg *args, struct sample *smp)
+{
+	if (!l4->stkctr[2].entry)
+		return 0;
+
+	return smp_fetch_bytes_out_rate(l4->stkctr[2].table, smp, l4->stkctr[2].entry);
 }
 
 /* set temp integer to the bytes rate to client from the session's source address in
@@ -3560,9 +3872,9 @@ smp_fetch_src_bytes_out_rate(struct proxy *px, struct session *l4, void *l7, uns
 	return smp_fetch_bytes_out_rate(&px->table, smp, stktable_lookup_key(&px->table, key));
 }
 
-/* set temp integer to the number of active trackers on the SC1 entry */
+/* set temp integer to the number of active trackers on the SC0 entry */
 static int
-smp_fetch_sc1_trackers(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+smp_fetch_sc0_trackers(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                        const struct arg *args, struct sample *smp)
 {
 	if (!l4->stkctr[0].entry)
@@ -3571,15 +3883,26 @@ smp_fetch_sc1_trackers(struct proxy *px, struct session *l4, void *l7, unsigned 
 	return l4->stkctr[0].entry->ref_cnt;
 }
 
-/* set temp integer to the number of active trackers on the SC1 entry */
+/* set temp integer to the number of active trackers on the SC0 entry */
 static int
-smp_fetch_sc2_trackers(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+smp_fetch_sc1_trackers(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                        const struct arg *args, struct sample *smp)
 {
 	if (!l4->stkctr[1].entry)
 		return 0;
 
 	return l4->stkctr[1].entry->ref_cnt;
+}
+
+/* set temp integer to the number of active trackers on the SC0 entry */
+static int
+smp_fetch_sc2_trackers(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                       const struct arg *args, struct sample *smp)
+{
+	if (!l4->stkctr[2].entry)
+		return 0;
+
+	return l4->stkctr[2].entry->ref_cnt;
 }
 
 /* set temp integer to the number of used entries in the table pointed to by expr.
@@ -3613,59 +3936,6 @@ smp_fetch_table_avl(struct proxy *px, struct session *l4, void *l7, unsigned int
  * Please take care of keeping this list alphabetically sorted.
  */
 static struct acl_kw_list acl_kws = {{ },{
-	{ "sc1_bytes_in_rate",  NULL, acl_parse_int, acl_match_int },
-	{ "sc1_bytes_out_rate", NULL, acl_parse_int, acl_match_int },
-	{ "sc1_clr_gpc0",       NULL, acl_parse_int, acl_match_int },
-	{ "sc1_conn_cnt",       NULL, acl_parse_int, acl_match_int },
-	{ "sc1_conn_cur",       NULL, acl_parse_int, acl_match_int },
-	{ "sc1_conn_rate",      NULL, acl_parse_int, acl_match_int },
-	{ "sc1_get_gpc0",       NULL, acl_parse_int, acl_match_int },
-	{ "sc1_http_err_cnt",   NULL, acl_parse_int, acl_match_int },
-	{ "sc1_http_err_rate",  NULL, acl_parse_int, acl_match_int },
-	{ "sc1_http_req_cnt",   NULL, acl_parse_int, acl_match_int },
-	{ "sc1_http_req_rate",  NULL, acl_parse_int, acl_match_int },
-	{ "sc1_inc_gpc0",       NULL, acl_parse_int, acl_match_int },
-	{ "sc1_kbytes_in",      NULL, acl_parse_int, acl_match_int },
-	{ "sc1_kbytes_out",     NULL, acl_parse_int, acl_match_int },
-	{ "sc1_sess_cnt",       NULL, acl_parse_int, acl_match_int },
-	{ "sc1_sess_rate",      NULL, acl_parse_int, acl_match_int },
-	{ "sc1_trackers",       NULL, acl_parse_int, acl_match_int },
-	{ "sc2_bytes_in_rate",  NULL, acl_parse_int, acl_match_int },
-	{ "sc2_bytes_out_rate", NULL, acl_parse_int, acl_match_int },
-	{ "sc2_clr_gpc0",       NULL, acl_parse_int, acl_match_int },
-	{ "sc2_conn_cnt",       NULL, acl_parse_int, acl_match_int },
-	{ "sc2_conn_cur",       NULL, acl_parse_int, acl_match_int },
-	{ "sc2_conn_rate",      NULL, acl_parse_int, acl_match_int },
-	{ "sc2_get_gpc0",       NULL, acl_parse_int, acl_match_int },
-	{ "sc2_http_err_cnt",   NULL, acl_parse_int, acl_match_int },
-	{ "sc2_http_err_rate",  NULL, acl_parse_int, acl_match_int },
-	{ "sc2_http_req_cnt",   NULL, acl_parse_int, acl_match_int },
-	{ "sc2_http_req_rate",  NULL, acl_parse_int, acl_match_int },
-	{ "sc2_inc_gpc0",       NULL, acl_parse_int, acl_match_int },
-	{ "sc2_kbytes_in",      NULL, acl_parse_int, acl_match_int },
-	{ "sc2_kbytes_out",     NULL, acl_parse_int, acl_match_int },
-	{ "sc2_sess_cnt",       NULL, acl_parse_int, acl_match_int },
-	{ "sc2_sess_rate",      NULL, acl_parse_int, acl_match_int },
-	{ "sc2_trackers",       NULL, acl_parse_int, acl_match_int },
-	{ "src_bytes_in_rate",  NULL, acl_parse_int, acl_match_int },
-	{ "src_bytes_out_rate", NULL, acl_parse_int, acl_match_int },
-	{ "src_clr_gpc0",       NULL, acl_parse_int, acl_match_int },
-	{ "src_conn_cnt",       NULL, acl_parse_int, acl_match_int },
-	{ "src_conn_cur",       NULL, acl_parse_int, acl_match_int },
-	{ "src_conn_rate",      NULL, acl_parse_int, acl_match_int },
-	{ "src_get_gpc0",       NULL, acl_parse_int, acl_match_int },
-	{ "src_http_err_cnt",   NULL, acl_parse_int, acl_match_int },
-	{ "src_http_err_rate",  NULL, acl_parse_int, acl_match_int },
-	{ "src_http_req_cnt",   NULL, acl_parse_int, acl_match_int },
-	{ "src_http_req_rate",  NULL, acl_parse_int, acl_match_int },
-	{ "src_inc_gpc0",       NULL, acl_parse_int, acl_match_int },
-	{ "src_kbytes_in",      NULL, acl_parse_int, acl_match_int },
-	{ "src_kbytes_out",     NULL, acl_parse_int, acl_match_int },
-	{ "src_sess_cnt",       NULL, acl_parse_int, acl_match_int },
-	{ "src_sess_rate",      NULL, acl_parse_int, acl_match_int },
-	{ "src_updt_conn_cnt",  NULL, acl_parse_int, acl_match_int },
-	{ "table_avl",          NULL, acl_parse_int, acl_match_int },
-	{ "table_cnt",          NULL, acl_parse_int, acl_match_int },
 	{ /* END */ },
 }};
 
@@ -3673,6 +3943,25 @@ static struct acl_kw_list acl_kws = {{ },{
  * Please take care of keeping this list alphabetically sorted.
  */
 static struct sample_fetch_kw_list smp_fetch_keywords = {{ },{
+	{ "sc0_bytes_in_rate",  smp_fetch_sc0_bytes_in_rate,  0,           NULL, SMP_T_UINT, SMP_USE_INTRN, },
+	{ "sc0_bytes_out_rate", smp_fetch_sc0_bytes_out_rate, 0,           NULL, SMP_T_UINT, SMP_USE_INTRN, },
+	{ "sc0_clr_gpc0",       smp_fetch_sc0_clr_gpc0,       0,           NULL, SMP_T_UINT, SMP_USE_INTRN, },
+	{ "sc0_conn_cnt",       smp_fetch_sc0_conn_cnt,       0,           NULL, SMP_T_UINT, SMP_USE_INTRN, },
+	{ "sc0_conn_cur",       smp_fetch_sc0_conn_cur,       0,           NULL, SMP_T_UINT, SMP_USE_INTRN, },
+	{ "sc0_conn_rate",      smp_fetch_sc0_conn_rate,      0,           NULL, SMP_T_UINT, SMP_USE_INTRN, },
+	{ "sc0_get_gpc0",       smp_fetch_sc0_get_gpc0,       0,           NULL, SMP_T_UINT, SMP_USE_INTRN, },
+	{ "sc0_gpc0_rate",      smp_fetch_sc0_gpc0_rate,      0,           NULL, SMP_T_UINT, SMP_USE_INTRN, },
+	{ "sc0_http_err_cnt",   smp_fetch_sc0_http_err_cnt,   0,           NULL, SMP_T_UINT, SMP_USE_INTRN, },
+	{ "sc0_http_err_rate",  smp_fetch_sc0_http_err_rate,  0,           NULL, SMP_T_UINT, SMP_USE_INTRN, },
+	{ "sc0_http_req_cnt",   smp_fetch_sc0_http_req_cnt,   0,           NULL, SMP_T_UINT, SMP_USE_INTRN, },
+	{ "sc0_http_req_rate",  smp_fetch_sc0_http_req_rate,  0,           NULL, SMP_T_UINT, SMP_USE_INTRN, },
+	{ "sc0_inc_gpc0",       smp_fetch_sc0_inc_gpc0,       0,           NULL, SMP_T_UINT, SMP_USE_INTRN, },
+	{ "sc0_kbytes_in",      smp_fetch_sc0_kbytes_in,      0,           NULL, SMP_T_UINT, SMP_USE_L4CLI, },
+	{ "sc0_kbytes_out",     smp_fetch_sc0_kbytes_out,     0,           NULL, SMP_T_UINT, SMP_USE_L4CLI, },
+	{ "sc0_sess_cnt",       smp_fetch_sc0_sess_cnt,       0,           NULL, SMP_T_UINT, SMP_USE_INTRN, },
+	{ "sc0_sess_rate",      smp_fetch_sc0_sess_rate,      0,           NULL, SMP_T_UINT, SMP_USE_INTRN, },
+	{ "sc0_tracked",        smp_fetch_sc0_tracked,        0,           NULL, SMP_T_BOOL, SMP_USE_INTRN, },
+	{ "sc0_trackers",       smp_fetch_sc0_trackers,       0,           NULL, SMP_T_UINT, SMP_USE_INTRN, },
 	{ "sc1_bytes_in_rate",  smp_fetch_sc1_bytes_in_rate,  0,           NULL, SMP_T_UINT, SMP_USE_INTRN, },
 	{ "sc1_bytes_out_rate", smp_fetch_sc1_bytes_out_rate, 0,           NULL, SMP_T_UINT, SMP_USE_INTRN, },
 	{ "sc1_clr_gpc0",       smp_fetch_sc1_clr_gpc0,       0,           NULL, SMP_T_UINT, SMP_USE_INTRN, },
@@ -3680,6 +3969,7 @@ static struct sample_fetch_kw_list smp_fetch_keywords = {{ },{
 	{ "sc1_conn_cur",       smp_fetch_sc1_conn_cur,       0,           NULL, SMP_T_UINT, SMP_USE_INTRN, },
 	{ "sc1_conn_rate",      smp_fetch_sc1_conn_rate,      0,           NULL, SMP_T_UINT, SMP_USE_INTRN, },
 	{ "sc1_get_gpc0",       smp_fetch_sc1_get_gpc0,       0,           NULL, SMP_T_UINT, SMP_USE_INTRN, },
+	{ "sc1_gpc0_rate",      smp_fetch_sc1_gpc0_rate,      0,           NULL, SMP_T_UINT, SMP_USE_INTRN, },
 	{ "sc1_http_err_cnt",   smp_fetch_sc1_http_err_cnt,   0,           NULL, SMP_T_UINT, SMP_USE_INTRN, },
 	{ "sc1_http_err_rate",  smp_fetch_sc1_http_err_rate,  0,           NULL, SMP_T_UINT, SMP_USE_INTRN, },
 	{ "sc1_http_req_cnt",   smp_fetch_sc1_http_req_cnt,   0,           NULL, SMP_T_UINT, SMP_USE_INTRN, },
@@ -3689,6 +3979,7 @@ static struct sample_fetch_kw_list smp_fetch_keywords = {{ },{
 	{ "sc1_kbytes_out",     smp_fetch_sc1_kbytes_out,     0,           NULL, SMP_T_UINT, SMP_USE_L4CLI, },
 	{ "sc1_sess_cnt",       smp_fetch_sc1_sess_cnt,       0,           NULL, SMP_T_UINT, SMP_USE_INTRN, },
 	{ "sc1_sess_rate",      smp_fetch_sc1_sess_rate,      0,           NULL, SMP_T_UINT, SMP_USE_INTRN, },
+	{ "sc1_tracked",        smp_fetch_sc1_tracked,        0,           NULL, SMP_T_BOOL, SMP_USE_INTRN, },
 	{ "sc1_trackers",       smp_fetch_sc1_trackers,       0,           NULL, SMP_T_UINT, SMP_USE_INTRN, },
 	{ "sc2_bytes_in_rate",  smp_fetch_sc2_bytes_in_rate,  0,           NULL, SMP_T_UINT, SMP_USE_INTRN, },
 	{ "sc2_bytes_out_rate", smp_fetch_sc2_bytes_out_rate, 0,           NULL, SMP_T_UINT, SMP_USE_INTRN, },
@@ -3697,6 +3988,7 @@ static struct sample_fetch_kw_list smp_fetch_keywords = {{ },{
 	{ "sc2_conn_cur",       smp_fetch_sc2_conn_cur,       0,           NULL, SMP_T_UINT, SMP_USE_INTRN, },
 	{ "sc2_conn_rate",      smp_fetch_sc2_conn_rate,      0,           NULL, SMP_T_UINT, SMP_USE_INTRN, },
 	{ "sc2_get_gpc0",       smp_fetch_sc2_get_gpc0,       0,           NULL, SMP_T_UINT, SMP_USE_INTRN, },
+	{ "sc2_gpc0_rate",      smp_fetch_sc2_gpc0_rate,      0,           NULL, SMP_T_UINT, SMP_USE_INTRN, },
 	{ "sc2_http_err_cnt",   smp_fetch_sc2_http_err_cnt,   0,           NULL, SMP_T_UINT, SMP_USE_INTRN, },
 	{ "sc2_http_err_rate",  smp_fetch_sc2_http_err_rate,  0,           NULL, SMP_T_UINT, SMP_USE_INTRN, },
 	{ "sc2_http_req_cnt",   smp_fetch_sc2_http_req_cnt,   0,           NULL, SMP_T_UINT, SMP_USE_INTRN, },
@@ -3706,6 +3998,7 @@ static struct sample_fetch_kw_list smp_fetch_keywords = {{ },{
 	{ "sc2_kbytes_out",     smp_fetch_sc2_kbytes_out,     0,           NULL, SMP_T_UINT, SMP_USE_L4CLI, },
 	{ "sc2_sess_cnt",       smp_fetch_sc2_sess_cnt,       0,           NULL, SMP_T_UINT, SMP_USE_INTRN, },
 	{ "sc2_sess_rate",      smp_fetch_sc2_sess_rate,      0,           NULL, SMP_T_UINT, SMP_USE_INTRN, },
+	{ "sc2_tracked",        smp_fetch_sc2_tracked,        0,           NULL, SMP_T_BOOL, SMP_USE_INTRN, },
 	{ "sc2_trackers",       smp_fetch_sc2_trackers,       0,           NULL, SMP_T_UINT, SMP_USE_INTRN, },
 	{ "src_bytes_in_rate",  smp_fetch_src_bytes_in_rate,  ARG1(1,TAB), NULL, SMP_T_UINT, SMP_USE_L4CLI, },
 	{ "src_bytes_out_rate", smp_fetch_src_bytes_out_rate, ARG1(1,TAB), NULL, SMP_T_UINT, SMP_USE_L4CLI, },
@@ -3714,6 +4007,7 @@ static struct sample_fetch_kw_list smp_fetch_keywords = {{ },{
 	{ "src_conn_cur",       smp_fetch_src_conn_cur,       ARG1(1,TAB), NULL, SMP_T_UINT, SMP_USE_L4CLI, },
 	{ "src_conn_rate",      smp_fetch_src_conn_rate,      ARG1(1,TAB), NULL, SMP_T_UINT, SMP_USE_L4CLI, },
 	{ "src_get_gpc0",       smp_fetch_src_get_gpc0,       ARG1(1,TAB), NULL, SMP_T_UINT, SMP_USE_L4CLI, },
+	{ "src_gpc0_rate",      smp_fetch_src_gpc0_rate,      ARG1(1,TAB), NULL, SMP_T_UINT, SMP_USE_L4CLI, },
 	{ "src_http_err_cnt",   smp_fetch_src_http_err_cnt,   ARG1(1,TAB), NULL, SMP_T_UINT, SMP_USE_L4CLI, },
 	{ "src_http_err_rate",  smp_fetch_src_http_err_rate,  ARG1(1,TAB), NULL, SMP_T_UINT, SMP_USE_L4CLI, },
 	{ "src_http_req_cnt",   smp_fetch_src_http_req_cnt,   ARG1(1,TAB), NULL, SMP_T_UINT, SMP_USE_L4CLI, },
