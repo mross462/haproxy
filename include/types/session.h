@@ -90,20 +90,17 @@
 
 #define SN_COMP_READY   0x00100000	/* the compression is initialized */
 
-/* session tracking flags: these ones must absolutely be contiguous. See also s->stkctr */
-#define SN_BE_TRACK_SC0 0x00200000	/* backend tracks stick-counter 0 */
-#define SN_BE_TRACK_SC1 0x00400000	/* backend tracks stick-counter 1 */
-#define SN_BE_TRACK_SC2 0x00800000	/* backend tracks stick-counter 2 */
-#define SN_BE_TRACK_ANY 0x00E00000      /* union of all SN_BE_TRACK_* above */
-
-
-/* WARNING: if new fields are added, they must be initialized in event_accept()
+/* WARNING: if new fields are added, they must be initialized in session_accept()
  * and freed in session_free() !
  */
 
-/* stick counter */
+#define STKCTR_TRACK_BACKEND 1
+#define STKCTR_TRACK_CONTENT 2
+/* stick counter. The <entry> member is a composite address (caddr) made of a
+ * pointer to an stksess struct, and two flags among STKCTR_TRACK_* above.
+ */
 struct stkctr {
-	struct stksess *entry;          /* entry containing counters currently being tracked  by this session */
+	unsigned long   entry;          /* entry containing counters currently being tracked by this session  */
 	struct stktable *table;         /* table the counters above belong to (undefined if counters are null) */
 };
 
@@ -120,7 +117,8 @@ struct stkctr {
  */
 struct session {
 	int flags;				/* some flags describing the session */
-	enum obj_type *target;			/* target to use for this session */
+	unsigned int uniq_id;			/* unique ID used for the traces */
+	enum obj_type *target;			/* target to use for this session ; for mini-sess: incoming connection */
 
 	struct channel *req;			/* request buffer */
 	struct channel *rep;			/* response buffer */
@@ -142,11 +140,11 @@ struct session {
 	struct {
 		struct stksess *ts;
 		struct stktable *table;
-		int flags;
 	} store[8];				/* tracked stickiness values to store */
 	int store_count;
+	/* 4 unused bytes here */
 
-	struct stkctr stkctr[3];                /* stick counters */
+	struct stkctr stkctr[MAX_SESS_STKCTR];  /* stick counters */
 
 	struct stream_interface si[2];          /* client and server stream interfaces */
 	struct {
@@ -167,7 +165,6 @@ struct session {
 	void (*do_log)(struct session *s);	/* the function to call in order to log (or NULL) */
 	void (*srv_error)(struct session *s,	/* the function to call upon unrecoverable server errors (or NULL) */
 			  struct stream_interface *si);
-	unsigned int uniq_id;			/* unique ID used for the traces */
 	struct comp_ctx *comp_ctx;		/* HTTP compression context */
 	struct comp_algo *comp_algo;		/* HTTP compression algorithm if not NULL */
 	char *unique_id;			/* custom unique ID */
